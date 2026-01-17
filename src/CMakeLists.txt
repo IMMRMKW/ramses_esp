@@ -13,7 +13,7 @@
 # This file was automatically generated for projects
 # without default 'CMakeLists.txt' file.
 
-FILE(GLOB app_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/*.c)
+FILE(GLOB app_sources ${CMAKE_CURRENT_LIST_DIR}/*.c)
 
 idf_component_register(
     SRCS ${app_sources}
