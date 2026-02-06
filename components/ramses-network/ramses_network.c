@@ -14,12 +14,16 @@
 #include "freertos/FreeRTOS.h"
 
 #include "esp_err.h"
+#include "esp_log.h"
 #include "esp_netif.h"
 #include "nvs.h"
 
 #include "ramses_ota.h"
 #include "ramses_sntp.h"
 #include "ramses_wifi.h"
+#include "zigbee.h"
+
+static const char* TAG = "NETWORK";
 
 // NVS identifiers
 #define NETWORK_NAMESPACE "network"
@@ -374,7 +378,8 @@ void ramses_network_init(BaseType_t coreID)
         net_get_timezone(ctxt);
     }
 
-    ramses_sntp_init(coreID, ctxt->sntp_server);
-    ramses_ota_init(coreID);
-    ramses_wifi_init(coreID);
+    // ramses_sntp_init(coreID, ctxt->sntp_server);  // DISABLED - crashes if sntp_server is NULL
+    // ramses_ota_init(coreID);  // DISABLED for now
+    ramses_zigbee_init(coreID);
+    // ramses_wifi_init(coreID); // disabled for now
 }

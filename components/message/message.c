@@ -52,7 +52,7 @@ static void msg_put(struct msg_list* list, struct message** ppMsg, uint8_t reset
     struct message* pMsg = NULL;
     if (ppMsg && list) {
         // uint32_t volatile register ilevel = XTOS_DISABLE_ALL_INTERRUPTS;
-        taskDISABLE_INTERRUPTS();
+        //taskDISABLE_INTERRUPTS();
         pMsg = (*ppMsg);
         if (pMsg) {
 
@@ -71,7 +71,7 @@ static void msg_put(struct msg_list* list, struct message** ppMsg, uint8_t reset
             (*ppMsg) = NULL;
         }
         // XTOS_RESTORE_INTLEVEL(ilevel);
-        taskENABLE_INTERRUPTS();
+        //taskENABLE_INTERRUPTS();
     }
 }
 
