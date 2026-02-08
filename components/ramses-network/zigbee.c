@@ -55,9 +55,96 @@ static const char* k_default_text = "";
 static uint8_t sensor_text[ZIGBEE_TEXT_MAX + 1] = {0};
 static uint8_t sensor_text_staging[ZIGBEE_TEXT_MAX + 1] = {0};
 static uint8_t received_text[ZIGBEE_TEXT_MAX + 1] = {0};
-static char zigbee_rx_pending[ZIGBEE_TEXT_MAX] = {0};
+
+#define ZIGBEE_RX_RING_SIZE 4
+static char zigbee_rx_ring[ZIGBEE_RX_RING_SIZE][ZIGBEE_TEXT_MAX] = {0};
+static size_t zigbee_rx_ring_len[ZIGBEE_RX_RING_SIZE] = {0};
+static volatile uint8_t zigbee_rx_ring_head = 0;
+static volatile uint8_t zigbee_rx_ring_tail = 0;
+static char zigbee_rx_pending_buf[ZIGBEE_TEXT_MAX] = {0};
 static volatile size_t zigbee_rx_pending_len = 0;
 static volatile bool zigbee_rx_pending_valid = false;
+
+struct zigbee_chunk_state {
+	bool active;
+	uint8_t total;
+	uint8_t next_seq;
+	size_t length;
+	char buffer[ZIGBEE_TEXT_MAX + 1];
+};
+
+static struct zigbee_chunk_state chunk_state = {0};
+
+static bool zigbee_handle_chunked_text(const char* text);
+static void zigbee_tx_to_frame(const char* text);
+static void zigbee_chunk_reset(void)
+{
+	chunk_state.active = false;
+	chunk_state.total = 0;
+	chunk_state.next_seq = 1;
+	chunk_state.length = 0;
+	chunk_state.buffer[0] = '\0';
+}
+
+static bool zigbee_handle_chunked_text(const char* text)
+{
+	if (!text || !*text)
+		return false;
+
+	int header_len = 0;
+	unsigned int seq = 0;
+	unsigned int total = 0;
+	if (sscanf(text, "%u/%u|%n", &seq, &total, &header_len) != 2 || header_len <= 0)
+		return false;
+
+	if (total <= 1)
+		return false;
+
+	if (seq == 0 || seq > total) {
+		ESP_LOGW(TAG, "Zigbee chunk invalid seq=%u total=%u", seq, total);
+		zigbee_chunk_reset();
+		return true;
+	}
+
+	const char* body = text + header_len;
+	size_t body_len = strlen(body);
+	if (body_len == 0) {
+		ESP_LOGW(TAG, "Zigbee chunk %u/%u has empty body", seq, total);
+		return true;
+	}
+
+	if (!chunk_state.active || seq == 1) {
+		zigbee_chunk_reset();
+		chunk_state.active = true;
+		chunk_state.total = (uint8_t)total;
+		chunk_state.next_seq = 1;
+	}
+
+	if (chunk_state.next_seq != seq) {
+		ESP_LOGW(TAG, "Zigbee chunk out of order (expected %u got %u)", chunk_state.next_seq, seq);
+		zigbee_chunk_reset();
+		return true;
+	}
+
+	if (chunk_state.length + body_len >= sizeof(chunk_state.buffer)) {
+		ESP_LOGW(TAG, "Zigbee chunk buffer overflow (len=%u body=%u)", (unsigned int)chunk_state.length, (unsigned int)body_len);
+		zigbee_chunk_reset();
+		return true;
+	}
+
+	memcpy(&chunk_state.buffer[chunk_state.length], body, body_len);
+	chunk_state.length += body_len;
+	chunk_state.buffer[chunk_state.length] = '\0';
+	chunk_state.next_seq++;
+
+	if (seq == total) {
+		ESP_LOGI(TAG, "Zigbee chunk assembly complete (%u bytes)", (unsigned int)chunk_state.length);
+		zigbee_tx_to_frame(chunk_state.buffer);
+		zigbee_chunk_reset();
+	}
+
+	return true;
+}
 
 enum zigbee_msg_type {
 	ZB_MSG_SENSOR_UPDATE,
@@ -80,19 +167,6 @@ struct zigbee_data {
 
 static struct zigbee_data* zigbee_ctxt(void);
 
-static void zigbee_store_rx_text_len(const char* text, size_t len)
-{
-	if (!text || len == 0)
-		return;
-	if (len > ZIGBEE_TEXT_MAX - 1)
-		len = ZIGBEE_TEXT_MAX - 1;
-
-	memcpy(zigbee_rx_pending, text, len);
-	zigbee_rx_pending[len] = '\0';
-	zigbee_rx_pending_len = len;
-	zigbee_rx_pending_valid = true;
-}
-
 static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 {
 	struct zigbee_data* ctxt = zigbee_ctxt();
@@ -105,8 +179,33 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 	strncpy(msg.text, text, sizeof(msg.text) - 1);
 	msg.text[sizeof(msg.text) - 1] = '\0';
 
-	xQueueSend(ctxt->queue, &msg, 0);
+	if (xPortInIsrContext()) {
+		BaseType_t higher_priority_woken = pdFALSE;
+		xQueueSendFromISR(ctxt->queue, &msg, &higher_priority_woken);
+	} else {
+		xQueueSend(ctxt->queue, &msg, 0);
+	}
 }
+
+static void zigbee_store_rx_text_len(const char* text, size_t len)
+{
+	if (!text || len == 0)
+		return;
+	if (len > ZIGBEE_TEXT_MAX - 1)
+		len = ZIGBEE_TEXT_MAX - 1;
+
+	uint8_t head = zigbee_rx_ring_head;
+	uint8_t next = (uint8_t)((head + 1) % ZIGBEE_RX_RING_SIZE);
+	if (next == zigbee_rx_ring_tail) {
+		return;
+	}
+
+	memcpy(zigbee_rx_ring[head], text, len);
+	zigbee_rx_ring[head][len] = '\0';
+	zigbee_rx_ring_len[head] = len;
+	zigbee_rx_ring_head = next;
+}
+
 
 static struct zigbee_data* zigbee_ctxt(void)
 {
@@ -125,7 +224,8 @@ static struct zigbee_data* zigbee_ctxt(void)
 static void set_text_value(const char* text)
 {
 	size_t len = strlen(text);
-	if (len > ZIGBEE_TEXT_MAX - 1) len = ZIGBEE_TEXT_MAX - 1;
+	if (len > ZIGBEE_TEXT_MAX - 1)
+		len = ZIGBEE_TEXT_MAX - 1;
 	sensor_text_staging[0] = (uint8_t)len;
 	memcpy(&sensor_text_staging[1], text, len);
 	sensor_text_staging[len + 1] = '\0';
@@ -189,14 +289,19 @@ static void handle_rx_text(const uint8_t* data, uint16_t size)
 		return;
 
 	uint8_t text_len = data[0];
-	if (text_len == 0 || text_len >= sizeof(received_text) || size < (uint16_t)(text_len + 1))
+	if (text_len == 0 || size < (uint16_t)(text_len + 1) || text_len >= ZIGBEE_TEXT_MAX)
 		return;
 
 	received_text[0] = text_len;
 	memcpy(&received_text[1], data + 1, text_len);
 	received_text[text_len + 1] = '\0';
 
-	zigbee_store_rx_text_len((char*)&received_text[1], text_len);
+	if (!zigbee_rx_pending_valid) {
+		memcpy(zigbee_rx_pending_buf, &received_text[1], text_len);
+		zigbee_rx_pending_buf[text_len] = '\0';
+		zigbee_rx_pending_len = text_len;
+		zigbee_rx_pending_valid = true;
+	}
 }
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t* message)
@@ -207,6 +312,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t*
 	if (message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
 		return ESP_ERR_INVALID_ARG;
 	}
+
 
 	if (message->info.cluster == ZB_CLUSTER_TEXT_RECEIVE &&
 		message->attribute.id == ZB_ATTR_TEXT_STRING) {
@@ -224,6 +330,7 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 	if (message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
 		return ESP_ERR_INVALID_ARG;
 	}
+
 
 	handle_rx_text((const uint8_t*)message->data.value, message->data.size);
 	return ESP_OK;
@@ -250,8 +357,14 @@ static void update_attribute_callback(uint8_t param)
 static void update_sensor_text(const char* text)
 {
 	set_text_value(text);
+	if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+		ESP_LOGW(TAG, "Zigbee lock busy; deferring text update");
+		return;
+	}
 	esp_zb_scheduler_alarm((esp_zb_callback_t)update_attribute_callback, 0, 0);
+	esp_zb_lock_release();
 }
+
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -319,22 +432,20 @@ static void Zigbee(void* param)
 	}
 
 	while (1) {
-		char pending_text[ZIGBEE_TEXT_MAX];
-		size_t pending_len = 0;
-		bool has_pending = false;
-
 		if (zigbee_rx_pending_valid) {
-			pending_len = zigbee_rx_pending_len;
-			if (pending_len < ZIGBEE_TEXT_MAX) {
-				memcpy(pending_text, zigbee_rx_pending, pending_len + 1);
-				has_pending = true;
-			}
+			zigbee_store_rx_text_len(zigbee_rx_pending_buf, zigbee_rx_pending_len);
 			zigbee_rx_pending_valid = false;
 		}
 
-		if (has_pending) {
-			ESP_LOGI(TAG, "Received Zigbee text: %s", pending_text);
-			zigbee_tx_to_frame(pending_text);
+		while (zigbee_rx_ring_tail != zigbee_rx_ring_head) {
+			char* pending_text = zigbee_rx_ring[zigbee_rx_ring_tail];
+			if (pending_text[0] != '\0') {
+				ESP_LOGI(TAG, "Received Zigbee text: %s", pending_text);
+				if (!zigbee_handle_chunked_text(pending_text)) {
+					zigbee_tx_to_frame(pending_text);
+				}
+			}
+			zigbee_rx_ring_tail = (uint8_t)((zigbee_rx_ring_tail + 1) % ZIGBEE_RX_RING_SIZE);
 		}
 
 		struct zigbee_msg msg;
@@ -346,7 +457,10 @@ static void Zigbee(void* param)
 					update_sensor_text(msg.text);
 				break;
 			case ZB_MSG_TX_TO_FRAME:
-				zigbee_tx_to_frame(msg.text);
+				ESP_LOGI(TAG, "Received Zigbee text: %s", msg.text);
+				if (!zigbee_handle_chunked_text(msg.text)) {
+					zigbee_tx_to_frame(msg.text);
+				}
 				break;
 			default:
 				break;

@@ -93,3 +93,8 @@ CONFIG_FRM_LOG_LEVEL=0
 # Message Configuration
 CONFIG_N_MSG=16
 
+# Zigbee Configuration
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_ZED=y
+CONFIG_ZB_RADIO_NATIVE=y
+
