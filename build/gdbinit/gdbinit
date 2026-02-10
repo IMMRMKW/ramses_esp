@@ -1,0 +1,2 @@
+source C:/Dev/github/ramses_esp/build/gdbinit/symbols
+source C:/Dev/github/ramses_esp/build/gdbinit/connect
