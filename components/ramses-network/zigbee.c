@@ -10,6 +10,8 @@
 
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static const char* TAG = "ZIGBEE";
 #include "esp_log.h"
@@ -28,6 +30,8 @@ static const char* TAG = "ZIGBEE";
 
 #define ZIGBEE_TEXT_MAX 256
 #define ZIGBEE_QUEUE_LEN 10
+#define ZIGBEE_ZHA_MAX_STR_LEN 63
+#define ZIGBEE_ZHA_CHUNK_BODY_LEN 54
 
 #define ZB_TEXT_ENDPOINT            10
 #define ZB_CLUSTER_TEXT_SEND        0xFC00
@@ -51,9 +55,9 @@ static const char* TAG = "ZIGBEE";
 		},                                                          \
 	}
 
-static const char* k_default_text = "";
+
+/* Single static buffer for custom commands - stack copies data during cmd_req() call */
 static uint8_t sensor_text[ZIGBEE_TEXT_MAX + 1] = {0};
-static uint8_t sensor_text_staging[ZIGBEE_TEXT_MAX + 1] = {0};
 static uint8_t received_text[ZIGBEE_TEXT_MAX + 1] = {0};
 
 #define ZIGBEE_RX_RING_SIZE 4
@@ -77,6 +81,7 @@ static struct zigbee_chunk_state chunk_state = {0};
 
 static bool zigbee_handle_chunked_text(const char* text);
 static void zigbee_tx_to_frame(const char* text);
+static void zigbee_send_text_chunked(const char* text);
 static void zigbee_chunk_reset(void)
 {
 	chunk_state.active = false;
@@ -221,16 +226,6 @@ static struct zigbee_data* zigbee_ctxt(void)
 	return ctxt;
 }
 
-static void set_text_value(const char* text)
-{
-	size_t len = strlen(text);
-	if (len > ZIGBEE_TEXT_MAX - 1)
-		len = ZIGBEE_TEXT_MAX - 1;
-	sensor_text_staging[0] = (uint8_t)len;
-	memcpy(&sensor_text_staging[1], text, len);
-	sensor_text_staging[len + 1] = '\0';
-}
-
 static char const* zigbee_state_text(zigbee_state_t state)
 {
 	switch (state) {
@@ -289,7 +284,7 @@ static void handle_rx_text(const uint8_t* data, uint16_t size)
 		return;
 
 	uint8_t text_len = data[0];
-	if (text_len == 0 || size < (uint16_t)(text_len + 1) || text_len >= ZIGBEE_TEXT_MAX)
+	if (text_len == 0 || size < (uint16_t)(text_len + 1))
 		return;
 
 	received_text[0] = text_len;
@@ -316,6 +311,10 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t*
 
 	if (message->info.cluster == ZB_CLUSTER_TEXT_RECEIVE &&
 		message->attribute.id == ZB_ATTR_TEXT_STRING) {
+		if (!message->attribute.data.value || message->attribute.data.size == 0) {
+			ESP_LOGW(TAG, "zb_attribute_handler: empty attribute payload");
+			return ESP_ERR_INVALID_ARG;
+		}
 		handle_rx_text((uint8_t*)message->attribute.data.value, message->attribute.data.size);
 	}
 
@@ -331,8 +330,27 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 		return ESP_ERR_INVALID_ARG;
 	}
 
+	const uint8_t* data = (const uint8_t*)message->data.value;
+	uint16_t size = message->data.size;
+	if (!data || size == 0) {
+		ESP_LOGW(TAG, "zb_custom_cmd_handler: empty payload");
+		return ESP_ERR_INVALID_ARG;
+	}
 
-	handle_rx_text((const uint8_t*)message->data.value, message->data.size);
+	/* If payload looks like a length-prefixed ZCL char-string, pass through */
+	if (size >= 1 && data[0] < size && data[0] < ZIGBEE_TEXT_MAX) {
+		handle_rx_text(data, size);
+		return ESP_OK;
+	}
+
+	/* Otherwise wrap the plain payload into a local length-prefixed buffer */
+	uint8_t tmp[ZIGBEE_TEXT_MAX + 1];
+	size_t copy_len = size;
+	if (copy_len > ZIGBEE_TEXT_MAX - 1)
+		copy_len = ZIGBEE_TEXT_MAX - 1;
+	tmp[0] = (uint8_t)copy_len;
+	memcpy(&tmp[1], data, copy_len);
+	handle_rx_text(tmp, (uint16_t)(copy_len + 1));
 	return ESP_OK;
 }
 
@@ -348,21 +366,55 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 	}
 }
 
-static void update_attribute_callback(uint8_t param)
+static void zigbee_send_text_chunked(const char* text)
 {
-	(void)param;
-	memcpy(sensor_text, sensor_text_staging, sizeof(sensor_text));
-}
+	if (!text || text[0] == '\0')
+		return;
 
-static void update_sensor_text(const char* text)
-{
-	set_text_value(text);
+	size_t text_len = strlen(text);
+	
+	if (text_len > ZIGBEE_TEXT_MAX) {
+		ESP_LOGW(TAG, "Text too long (%u bytes), truncating to %u", (unsigned)text_len, ZIGBEE_TEXT_MAX);
+		text_len = ZIGBEE_TEXT_MAX;
+	}
+
+	/* Build length-prefixed ZCL char-string in static buffer */
+	sensor_text[0] = (uint8_t)text_len;
+	memcpy(&sensor_text[1], text, text_len);
+	sensor_text[text_len + 1] = '\0';
+
 	if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-		ESP_LOGW(TAG, "Zigbee lock busy; deferring text update");
+		ESP_LOGW(TAG, "Failed to acquire Zigbee lock");
 		return;
 	}
-	esp_zb_scheduler_alarm((esp_zb_callback_t)update_attribute_callback, 0, 0);
+
+	/* Send via custom cluster command - stack copies buffer synchronously during this call */
+	esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
+		.zcl_basic_cmd = {
+			.dst_addr_u.addr_short = 0x0000,
+			.dst_endpoint = 1,
+			.src_endpoint = ZB_TEXT_ENDPOINT,
+		},
+		.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+		.cluster_id = ZB_CLUSTER_TEXT_SEND,
+		.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+		.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+		.custom_cmd_id = 0x00,
+		.data = {
+			.type = ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
+			.value = sensor_text,
+			.size = (uint16_t)(text_len + 1),
+		},
+	};
+
+	esp_err_t err = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
 	esp_zb_lock_release();
+
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "Custom command send failed: %s", esp_err_to_name(err));
+	} else {
+		ESP_LOGI(TAG, "Sent text via custom command: %u bytes (APS fragmentation enabled)", (unsigned)text_len);
+	}
 }
 
 
@@ -413,7 +465,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
 		ctxt->ready = false;
 		zigbee_set_state(ctxt, ZIGBEE_STATE_ERROR);
 		esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
-							   ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+			       ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
 		break;
 	default:
 		break;
@@ -454,7 +506,7 @@ static void Zigbee(void* param)
 			switch (msg.type) {
 			case ZB_MSG_SENSOR_UPDATE:
 				if (ctxt->ready)
-					update_sensor_text(msg.text);
+					zigbee_send_text_chunked(msg.text);
 				break;
 			case ZB_MSG_TX_TO_FRAME:
 				ESP_LOGI(TAG, "Received Zigbee text: %s", msg.text);
@@ -477,8 +529,6 @@ static void zigbee_stack_task(void* param)
 	esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
 	esp_zb_init(&zb_nwk_cfg);
 
-	set_text_value(k_default_text);
-
 	esp_zb_ep_list_t* ep_list = esp_zb_ep_list_create();
 	esp_zb_cluster_list_t* cluster_list = esp_zb_zcl_cluster_list_create();
 
@@ -491,10 +541,9 @@ static void zigbee_stack_task(void* param)
 	esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void*)ESP_MODEL_IDENTIFIER);
 	esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+	/* Cluster 0xFC00 as CLIENT (output) - sends custom commands to coordinator */
 	esp_zb_attribute_list_t* text_send_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_TEXT_SEND);
-	esp_zb_cluster_add_attr(text_send_cluster, ZB_CLUSTER_TEXT_SEND, ZB_ATTR_TEXT_STRING,
-							ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, sensor_text);
-	esp_zb_cluster_list_add_custom_cluster(cluster_list, text_send_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+	esp_zb_cluster_list_add_custom_cluster(cluster_list, text_send_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
 	esp_zb_attribute_list_t* text_recv_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_TEXT_RECEIVE);
 	esp_zb_custom_cluster_add_custom_attr(text_recv_cluster, ZB_ATTR_TEXT_STRING,
@@ -521,6 +570,10 @@ static void zigbee_stack_task(void* param)
 	esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
 	ESP_ERROR_CHECK(esp_zb_start(false));
 
+	/* Enable APS fragmentation for large custom command payloads */
+	(void)esp_zb_aps_set_fragment_max_window_size(8);
+	(void)esp_zb_aps_set_fragment_interframe_delay(10);
+
 	esp_zb_stack_main_loop();
 }
 
@@ -531,8 +584,8 @@ void ramses_zigbee_init(BaseType_t coreID)
 
 	esp_log_level_set(TAG, ESP_LOG_INFO);
 
-	xTaskCreatePinnedToCore(zigbee_stack_task, "ZigbeeStack", 8192, NULL, 5, &ctxt->stack_task, ctxt->coreID);
-	xTaskCreatePinnedToCore(Zigbee, "Zigbee", 8192, ctxt, 10, &ctxt->task, ctxt->coreID);
+	xTaskCreatePinnedToCore(zigbee_stack_task, "ZigbeeStack", 16384, NULL, 5, &ctxt->stack_task, ctxt->coreID);
+	xTaskCreatePinnedToCore(Zigbee, "Zigbee", 16384, ctxt, 10, &ctxt->task, ctxt->coreID);
 }
 
 void zigbee_update_sensor_text(const char* text)

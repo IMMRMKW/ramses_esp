@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "ramses_esp_c6",
-    "project_version":    "v0.2-3-g4c12964-dirty",
+    "project_version":    "v0.2-4-gab51a99-dirty",
     "project_path":       "C:/Dev/github/ramses_esp",
     "idf_path":           "C:/Dev/esp/v5.5.2/esp-idf",
     "build_dir":          "C:/Dev/github/ramses_esp/build",
