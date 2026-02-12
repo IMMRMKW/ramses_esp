@@ -392,7 +392,7 @@ static void zigbee_send_text_chunked(const char* text)
 	esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
 		.zcl_basic_cmd = {
 			.dst_addr_u.addr_short = 0x0000,
-			.dst_endpoint = 1,
+			.dst_endpoint = ZB_TEXT_ENDPOINT,  /* Echo to same endpoint as source (10) */
 			.src_endpoint = ZB_TEXT_ENDPOINT,
 		},
 		.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,

@@ -1,3 +1,0 @@
-Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=c:\Dev\esp\.espressif\python_env\idf5.5_py3.11_env\Scripts\python.exe -DESP_PLATFORM=1 -DCCACHE_ENABLE=1 C:\Dev\github\ramses_esp
-info: Choice LWIP_TCPIP_TASK_AFFINITY has multiple active selections. The last one will be used: LWIP_TCPIP_TASK_AFFINITY_CPU0 .
-30aaf6452-4c12964-1.6.4-2026-02-08 10:28:27 UTC

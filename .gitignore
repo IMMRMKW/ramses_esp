@@ -2,6 +2,7 @@
 .settings/
 .vscode/
 build/
+managed_components/
 *.code-workspace
 sdkconfig.esp32-c6-devkitm-1.old
 sdkconfig.local
