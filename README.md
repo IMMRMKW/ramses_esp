@@ -15,5 +15,6 @@ Improvements that I made:
   - It should now be possible to upload the software to both single and multi-core ESPs. (But I only tested this on the ESP32-C6, feel free to try this with other processors)
 
 ## Support
-Buy me a coffee or purchase the board that I made for this in my [shop](https://elecram.com/products/esp32-c6-wifi-zigbee-to-855-925mhz-wireless?variant=52605637099853) or on [Tindie](https://www.tindie.com/products/elecram/esp32-c6-wifizigbee-to-855-925mhz-wireless/).  
+Buy me a coffee or purchase the board that I made for this in my [shop](https://elecram.com/products/esp32-c6-wifi-zigbee-to-855-925mhz-wireless?variant=52605637099853) or on [Tindie](https://www.tindie.com/products/elecram/esp32-c6-wifizigbee-to-855-925mhz-wireless/).
+
 <a href="https://www.buymeacoffee.com/immrmkw" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
