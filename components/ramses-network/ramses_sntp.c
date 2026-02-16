@@ -207,7 +207,7 @@ void ramses_sntp_init(BaseType_t coreID, char* server)
     ctxt->coreID = coreID;
 
     if (server && server[0] != '\0')
-        strncpy(ctxt->server, server, sizeof(ctxt->server));
+        snprintf(ctxt->server, sizeof(ctxt->server), "%s", server);
 
     ESP_LOGI(TAG, "Will connect to SNTP server name: %s", server);
 

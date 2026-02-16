@@ -29,9 +29,11 @@ static const char* TAG = "ZIGBEE";
 #include "zigbee.h"
 
 #define ZIGBEE_TEXT_MAX 256
-#define ZIGBEE_QUEUE_LEN 10
+#define ZIGBEE_QUEUE_LEN 100  /* Increased to handle RF message bursts without drops */
+#define ZIGBEE_RX_QUEUE_LEN 8
 #define ZIGBEE_ZHA_MAX_STR_LEN 63
-#define ZIGBEE_ZHA_CHUNK_BODY_LEN 54
+#define ZIGBEE_ZHA_CHUNK_BODY_LEN 32  /* Reduced from 54 to prevent APS fragmentation */
+#define ZIGBEE_TX_CONFIRM_TIMEOUT_MS 5000  /* Watchdog: clear tx_busy if no confirm in 1s */
 
 #define ZB_TEXT_ENDPOINT            10
 #define ZB_CLUSTER_TEXT_SEND        0xFC00
@@ -42,8 +44,8 @@ static const char* TAG = "ZIGBEE";
 #define ED_AGING_TIMEOUT                ESP_ZB_ED_AGING_TIMEOUT_64MIN
 #define ED_KEEP_ALIVE                   3000
 
-#define ESP_MANUFACTURER_NAME "\x09""ESPRESSIF"
-#define ESP_MODEL_IDENTIFIER "\x07"CONFIG_IDF_TARGET
+#define ESP_MANUFACTURER_NAME "\x07""ELECRAM"
+#define ESP_MODEL_IDENTIFIER "\x0ERamses_esp32c6"
 
 #define ESP_ZB_ZED_CONFIG()                                         \
 	{                                                               \
@@ -60,14 +62,12 @@ static const char* TAG = "ZIGBEE";
 static uint8_t sensor_text[ZIGBEE_TEXT_MAX + 1] = {0};
 static uint8_t received_text[ZIGBEE_TEXT_MAX + 1] = {0};
 
-#define ZIGBEE_RX_RING_SIZE 4
-static char zigbee_rx_ring[ZIGBEE_RX_RING_SIZE][ZIGBEE_TEXT_MAX] = {0};
-static size_t zigbee_rx_ring_len[ZIGBEE_RX_RING_SIZE] = {0};
-static volatile uint8_t zigbee_rx_ring_head = 0;
-static volatile uint8_t zigbee_rx_ring_tail = 0;
-static char zigbee_rx_pending_buf[ZIGBEE_TEXT_MAX] = {0};
-static volatile size_t zigbee_rx_pending_len = 0;
-static volatile bool zigbee_rx_pending_valid = false;
+struct zigbee_rx_msg {
+	char text[ZIGBEE_TEXT_MAX];
+	size_t len;
+};
+
+static QueueHandle_t zigbee_rx_queue = NULL;
 
 struct zigbee_chunk_state {
 	bool active;
@@ -78,6 +78,13 @@ struct zigbee_chunk_state {
 };
 
 static struct zigbee_chunk_state chunk_state = {0};
+
+enum zigbee_msg_type {
+	ZB_MSG_SENSOR_UPDATE,
+	ZB_MSG_TX_TO_FRAME,
+};
+
+static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text);
 
 static bool zigbee_handle_chunked_text(const char* text);
 static void zigbee_tx_to_frame(const char* text);
@@ -151,11 +158,6 @@ static bool zigbee_handle_chunked_text(const char* text)
 	return true;
 }
 
-enum zigbee_msg_type {
-	ZB_MSG_SENSOR_UPDATE,
-	ZB_MSG_TX_TO_FRAME,
-};
-
 struct zigbee_msg {
 	enum zigbee_msg_type type;
 	char text[ZIGBEE_TEXT_MAX];
@@ -168,6 +170,8 @@ struct zigbee_data {
 	QueueHandle_t queue;
 	zigbee_state_t state;
 	bool ready;
+	volatile bool tx_busy;  /* Single in-flight TX gate to prevent buffer pool exhaustion */
+	TickType_t tx_busy_timestamp;  /* Watchdog timestamp for tx_busy */
 };
 
 static struct zigbee_data* zigbee_ctxt(void);
@@ -184,6 +188,8 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 	strncpy(msg.text, text, sizeof(msg.text) - 1);
 	msg.text[sizeof(msg.text) - 1] = '\0';
 
+	ESP_LOGI(TAG, "Queuing msg type=%d ready=%d tx_busy=%d text=%s", type, ctxt->ready, ctxt->tx_busy, text);
+
 	if (xPortInIsrContext()) {
 		BaseType_t higher_priority_woken = pdFALSE;
 		xQueueSendFromISR(ctxt->queue, &msg, &higher_priority_woken);
@@ -192,23 +198,24 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 	}
 }
 
-static void zigbee_store_rx_text_len(const char* text, size_t len)
+static void zigbee_enqueue_rx_text(const char* text, size_t len)
 {
-	if (!text || len == 0)
+	if (!text || len == 0 || !zigbee_rx_queue)
 		return;
 	if (len > ZIGBEE_TEXT_MAX - 1)
 		len = ZIGBEE_TEXT_MAX - 1;
 
-	uint8_t head = zigbee_rx_ring_head;
-	uint8_t next = (uint8_t)((head + 1) % ZIGBEE_RX_RING_SIZE);
-	if (next == zigbee_rx_ring_tail) {
-		return;
-	}
+	struct zigbee_rx_msg rx_msg;
+	memcpy(rx_msg.text, text, len);
+	rx_msg.text[len] = '\0';
+	rx_msg.len = len;
 
-	memcpy(zigbee_rx_ring[head], text, len);
-	zigbee_rx_ring[head][len] = '\0';
-	zigbee_rx_ring_len[head] = len;
-	zigbee_rx_ring_head = next;
+	if (xPortInIsrContext()) {
+		BaseType_t higher_priority_woken = pdFALSE;
+		xQueueSendFromISR(zigbee_rx_queue, &rx_msg, &higher_priority_woken);
+	} else {
+		xQueueSend(zigbee_rx_queue, &rx_msg, 0);
+	}
 }
 
 
@@ -217,6 +224,8 @@ static struct zigbee_data* zigbee_ctxt(void)
 	static struct zigbee_data zigbee = {
 		.state = ZIGBEE_STATE_IDLE,
 		.ready = false,
+		.tx_busy = false,
+		.tx_busy_timestamp = 0,
 	};
 	static struct zigbee_data* ctxt = NULL;
 	if (!ctxt) {
@@ -291,12 +300,8 @@ static void handle_rx_text(const uint8_t* data, uint16_t size)
 	memcpy(&received_text[1], data + 1, text_len);
 	received_text[text_len + 1] = '\0';
 
-	if (!zigbee_rx_pending_valid) {
-		memcpy(zigbee_rx_pending_buf, &received_text[1], text_len);
-		zigbee_rx_pending_buf[text_len] = '\0';
-		zigbee_rx_pending_len = text_len;
-		zigbee_rx_pending_valid = true;
-	}
+	/* Enqueue to RX queue for processing */
+	zigbee_enqueue_rx_text((const char*)&received_text[1], text_len);
 }
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t* message)
@@ -338,7 +343,7 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 	}
 
 	/* If payload looks like a length-prefixed ZCL char-string, pass through */
-	if (size >= 1 && data[0] < size && data[0] < ZIGBEE_TEXT_MAX) {
+	if (size >= 1 && data[0] < size) {
 		handle_rx_text(data, size);
 		return ESP_OK;
 	}
@@ -352,6 +357,25 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 	memcpy(&tmp[1], data, copy_len);
 	handle_rx_text(tmp, (uint16_t)(copy_len + 1));
 	return ESP_OK;
+}
+
+static void zb_apsde_data_confirm_handler(esp_zb_apsde_data_confirm_t confirm)
+{
+	struct zigbee_data* ctxt = zigbee_ctxt();
+	if (!ctxt)
+		return;
+
+	/* Clear tx_busy now that we have received APSDE-DATA.confirm */
+	if (ctxt->tx_busy) {
+		ctxt->tx_busy = false;
+		if (confirm.status == ESP_ZB_ZDP_STATUS_SUCCESS) {
+			ESP_LOGI(TAG, "APS TX confirmed, cleared tx_busy");
+		} else {
+			ESP_LOGW(TAG, "APS TX failed, status=0x%02x, cleared tx_busy", confirm.status);
+		}
+	} else {
+		ESP_LOGW(TAG, "APS confirm received but tx_busy was already false");
+	}
 }
 
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void* message)
@@ -371,17 +395,27 @@ static void zigbee_send_text_chunked(const char* text)
 	if (!text || text[0] == '\0')
 		return;
 
-	size_t text_len = strlen(text);
-	
-	if (text_len > ZIGBEE_TEXT_MAX) {
-		ESP_LOGW(TAG, "Text too long (%u bytes), truncating to %u", (unsigned)text_len, ZIGBEE_TEXT_MAX);
-		text_len = ZIGBEE_TEXT_MAX;
+	struct zigbee_data* ctxt = zigbee_ctxt();
+	if (!ctxt) {
+		ESP_LOGW(TAG, "No context, cannot send");
+		return;
 	}
 
-	/* Build length-prefixed ZCL char-string in static buffer */
-	sensor_text[0] = (uint8_t)text_len;
-	memcpy(&sensor_text[1], text, text_len);
-	sensor_text[text_len + 1] = '\0';
+	size_t text_len = strlen(text);
+
+	/* Ensure room for leading length byte and terminating NUL in local buffer */
+	if (text_len > (ZIGBEE_TEXT_MAX - 1)) {
+		ESP_LOGW(TAG, "Text too long (%u bytes), truncating to %u", (unsigned)text_len, (unsigned)(ZIGBEE_TEXT_MAX - 1));
+		text_len = (ZIGBEE_TEXT_MAX - 1);
+	}
+
+	/* Build length-prefixed ZCL char-string in a local buffer to avoid
+	 * corrupting shared static memory. The stack API copies the buffer
+	 * synchronously during the request. */
+	uint8_t local_sensor[ZIGBEE_TEXT_MAX + 1];
+	local_sensor[0] = (uint8_t)text_len;
+	memcpy(&local_sensor[1], text, text_len);
+	local_sensor[text_len + 1] = '\0';
 
 	if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
 		ESP_LOGW(TAG, "Failed to acquire Zigbee lock");
@@ -392,7 +426,7 @@ static void zigbee_send_text_chunked(const char* text)
 	esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
 		.zcl_basic_cmd = {
 			.dst_addr_u.addr_short = 0x0000,
-			.dst_endpoint = ZB_TEXT_ENDPOINT,  /* Echo to same endpoint as source (10) */
+			.dst_endpoint = ZB_TEXT_ENDPOINT,  /* Quirk creates endpoint 10 on coordinator */
 			.src_endpoint = ZB_TEXT_ENDPOINT,
 		},
 		.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
@@ -402,18 +436,22 @@ static void zigbee_send_text_chunked(const char* text)
 		.custom_cmd_id = 0x00,
 		.data = {
 			.type = ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
-			.value = sensor_text,
+			.value = NULL,
 			.size = (uint16_t)(text_len + 1),
 		},
 	};
 
+	/* Point the command at our local buffer */
+	cmd_req.data.value = local_sensor;
+
 	esp_err_t err = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
 	esp_zb_lock_release();
 
+	/* Log numeric error code for visibility but do not treat as fatal */
 	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "Custom command send failed: %s", esp_err_to_name(err));
+		ESP_LOGI(TAG, "Custom command send result: %s (0x%08x)", esp_err_to_name(err), (unsigned)err);
 	} else {
-		ESP_LOGI(TAG, "Sent text via custom command: %u bytes (APS fragmentation enabled)", (unsigned)text_len);
+		ESP_LOGI(TAG, "Sent text chunk: %u bytes", (unsigned)text_len);
 	}
 }
 
@@ -434,10 +472,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
 
 	switch (sig_type) {
 	case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
+		/* End device: start initialization only */
 		esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
 		break;
 	case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
 	case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
+		/* End device: start network steering after initialization */
 		if (err_status == ESP_OK) {
 			zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
 			esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
@@ -447,14 +487,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
 		if (err_status == ESP_OK) {
 			zigbee_set_state(ctxt, ZIGBEE_STATE_CONNECTED);
 			ctxt->ready = true;
-			
-			esp_zb_zcl_start_attr_reporting((esp_zb_zcl_attr_location_info_t){
-				.endpoint_id = ZB_TEXT_ENDPOINT,
-				.cluster_id = ZB_CLUSTER_TEXT_SEND,
-				.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-				.manuf_code = ESP_ZB_ZCL_ATTR_NON_MANUFACTURER_SPECIFIC,
-				.attr_id = ZB_ATTR_TEXT_STRING,
-			});
 		} else {
 			zigbee_set_state(ctxt, ZIGBEE_STATE_ERROR);
 			esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
@@ -478,35 +510,42 @@ static void Zigbee(void* param)
 
 	ctxt->queue = xQueueCreate(ZIGBEE_QUEUE_LEN, sizeof(struct zigbee_msg));
 	if (!ctxt->queue) {
-		ESP_LOGE(TAG, "Failed to create queue!");
+		ESP_LOGE(TAG, "Failed to create TX queue!");
 		vTaskDelete(NULL);
 		return;
 	}
 
-	while (1) {
-		if (zigbee_rx_pending_valid) {
-			zigbee_store_rx_text_len(zigbee_rx_pending_buf, zigbee_rx_pending_len);
-			zigbee_rx_pending_valid = false;
-		}
+	zigbee_rx_queue = xQueueCreate(ZIGBEE_RX_QUEUE_LEN, sizeof(struct zigbee_rx_msg));
+	if (!zigbee_rx_queue) {
+		ESP_LOGE(TAG, "Failed to create RX queue!");
+		vTaskDelete(NULL);
+		return;
+	}
 
-		while (zigbee_rx_ring_tail != zigbee_rx_ring_head) {
-			char* pending_text = zigbee_rx_ring[zigbee_rx_ring_tail];
-			if (pending_text[0] != '\0') {
-				ESP_LOGI(TAG, "Received Zigbee text: %s", pending_text);
-				if (!zigbee_handle_chunked_text(pending_text)) {
-					zigbee_tx_to_frame(pending_text);
-				}
+	for (;;) {
+		/* Drain RX first (always) */
+		struct zigbee_rx_msg rx_msg;
+		while (xQueueReceive(zigbee_rx_queue, &rx_msg, 0) == pdTRUE) {
+			ESP_LOGI(TAG, "Received Zigbee text: %s", rx_msg.text);
+			if (!zigbee_handle_chunked_text(rx_msg.text)) {
+				/* Non-chunked message - send to RF only, echo comes from serial RX */
+				zigbee_tx_to_frame(rx_msg.text);
 			}
-			zigbee_rx_ring_tail = (uint8_t)((zigbee_rx_ring_tail + 1) % ZIGBEE_RX_RING_SIZE);
 		}
 
+		/* Fire-and-forget TX: try to dequeue a TX message (short wait) and send immediately */
 		struct zigbee_msg msg;
-		BaseType_t res = xQueueReceive(ctxt->queue, &msg, pdMS_TO_TICKS(50));
-		if (res) {
+		BaseType_t res = xQueueReceive(ctxt->queue, &msg, pdMS_TO_TICKS(20));
+		if (res == pdTRUE) {
+			ESP_LOGI(TAG, "Dequeued msg type=%d ready=%d", msg.type, ctxt->ready);
 			switch (msg.type) {
 			case ZB_MSG_SENSOR_UPDATE:
-				if (ctxt->ready)
+				if (ctxt->ready) {
+					ESP_LOGI(TAG, "Sending to Zigbee (fire-and-forget): %s", msg.text);
 					zigbee_send_text_chunked(msg.text);
+				} else {
+					ESP_LOGW(TAG, "Cannot send, not ready");
+				}
 				break;
 			case ZB_MSG_TX_TO_FRAME:
 				ESP_LOGI(TAG, "Received Zigbee text: %s", msg.text);
@@ -518,8 +557,6 @@ static void Zigbee(void* param)
 				break;
 			}
 		}
-
-		vTaskDelay(pdMS_TO_TICKS(1));
 	}
 }
 
@@ -567,12 +604,9 @@ static void zigbee_stack_task(void* param)
 	esp_zb_device_register(ep_list);
 
 	esp_zb_core_action_handler_register(zb_action_handler);
+	esp_zb_aps_data_confirm_handler_register(zb_apsde_data_confirm_handler);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
 	ESP_ERROR_CHECK(esp_zb_start(false));
-
-	/* Enable APS fragmentation for large custom command payloads */
-	(void)esp_zb_aps_set_fragment_max_window_size(8);
-	(void)esp_zb_aps_set_fragment_interframe_delay(10);
 
 	esp_zb_stack_main_loop();
 }
@@ -583,7 +617,11 @@ void ramses_zigbee_init(BaseType_t coreID)
 	ctxt->coreID = coreID;
 
 	esp_log_level_set(TAG, ESP_LOG_INFO);
-
+	/* Enable verbose Zigbee/ZBOSS logs for diagnosis (temporary) */
+	esp_log_level_set("esp_zb", ESP_LOG_DEBUG);
+	esp_log_level_set("zboss", ESP_LOG_DEBUG);
+	esp_log_level_set("ZIGBEE", ESP_LOG_DEBUG);
+	esp_log_level_set("ZIGBEE", ESP_LOG_DEBUG);
 	xTaskCreatePinnedToCore(zigbee_stack_task, "ZigbeeStack", 16384, NULL, 5, &ctxt->stack_task, ctxt->coreID);
 	xTaskCreatePinnedToCore(Zigbee, "Zigbee", 16384, ctxt, 10, &ctxt->task, ctxt->coreID);
 }

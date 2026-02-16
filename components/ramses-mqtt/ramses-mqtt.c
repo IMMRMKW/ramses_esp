@@ -286,10 +286,15 @@ static void mqtt_unsubscribe_cmd(struct mqtt_data* ctxt)
 
 static void mqtt_publish_cmd_result(struct mqtt_data* ctxt, char const* cmd, esp_err_t err, int retVal)
 {
-    char topic[192], data[128];
+    char topic[192];
+    char data[128];
 
-    sprintf(topic, "%s/cmd/result", ctxt->topic);
-    sprintf(data, "{ \"cmd\":\"%s\", \"err\":\"%s\", \"return\":%d} ", cmd, esp_err_to_name(err), retVal);
+    (void)snprintf(topic, sizeof(topic), "%s/cmd/result", ctxt->topic);
+    int n = snprintf(data, sizeof(data), "{ \"cmd\":\"%s\", \"err\":\"%s\", \"return\":%d} ", cmd ? cmd : "", esp_err_to_name(err), retVal);
+    if (n < 0) {
+        data[0] = '\0';
+    }
+    // snprintf guarantees NUL-termination; if truncated, publish the truncated string
     (void)esp_mqtt_client_publish(ctxt->client, topic, data, strlen(data), 0, 0);
 }
 
