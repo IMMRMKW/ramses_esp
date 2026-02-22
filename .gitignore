@@ -8,4 +8,6 @@ sdkconfig.esp32-c6-devkitm-1.old
 sdkconfig.local
 sdkconfig*.local
 !sdkconfig_example.local
+.github/agents/
+.github/instructions/
 

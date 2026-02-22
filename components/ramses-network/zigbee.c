@@ -36,9 +36,9 @@ static const char* TAG = "ZIGBEE";
 #define ZIGBEE_TX_CONFIRM_TIMEOUT_MS 5000  /* Watchdog: clear tx_busy if no confirm in 1s */
 
 #define ZB_TEXT_ENDPOINT            10
-#define ZB_CLUSTER_TEXT_SEND        0xFC00
-#define ZB_CLUSTER_TEXT_RECEIVE     0xFC01
-#define ZB_ATTR_TEXT_STRING         0x0000
+#define ZB_CLUSTER_RAMSES_RX        0xFC00  /* RAMSES RX: ESP -> ZHA (client command) */
+#define ZB_CLUSTER_RAMSES_TX        0xFC01  /* RAMSES TX: ZHA -> ESP (client command) */
+
 
 #define INSTALLCODE_POLICY_ENABLE       false
 #define ED_AGING_TIMEOUT                ESP_ZB_ED_AGING_TIMEOUT_64MIN
@@ -58,8 +58,7 @@ static const char* TAG = "ZIGBEE";
 	}
 
 
-/* Single static buffer for custom commands - stack copies data during cmd_req() call */
-static uint8_t sensor_text[ZIGBEE_TEXT_MAX + 1] = {0};
+/* Single static buffer for received custom command payloads */
 static uint8_t received_text[ZIGBEE_TEXT_MAX + 1] = {0};
 
 struct zigbee_rx_msg {
@@ -152,7 +151,7 @@ static bool zigbee_handle_chunked_text(const char* text)
 	chunk_state.next_seq++;
 
 	if (seq == total) {
-		ESP_LOGI(TAG, "Zigbee chunk assembly complete (%u bytes)", (unsigned int)chunk_state.length);
+		ESP_LOGD(TAG, "Zigbee chunk assembly complete (%u bytes)", (unsigned int)chunk_state.length);
 		zigbee_tx_to_frame(chunk_state.buffer);
 		zigbee_chunk_reset();
 	}
@@ -194,7 +193,7 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 	strncpy(msg.text, text, sizeof(msg.text) - 1);
 	msg.text[sizeof(msg.text) - 1] = '\0';
 
-	ESP_LOGI(TAG, "Queuing msg type=%d ready=%d tx_busy=%d text=%s", type, ctxt->ready, ctxt->tx_busy, text);
+	ESP_LOGD(TAG, "Queuing msg type=%d ready=%d tx_busy=%d text=%s", type, ctxt->ready, ctxt->tx_busy, text);
 
 	if (xPortInIsrContext()) {
 		BaseType_t higher_priority_woken = pdFALSE;
@@ -337,27 +336,8 @@ static void handle_rx_text(const uint8_t* data, uint16_t size)
 	}
 }
 
-static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t* message)
-{
-	if (!message) {
-		return ESP_FAIL;
-	}
-	if (message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
-		return ESP_ERR_INVALID_ARG;
-	}
-
-
-	if (message->info.cluster == ZB_CLUSTER_TEXT_RECEIVE &&
-		message->attribute.id == ZB_ATTR_TEXT_STRING) {
-		if (!message->attribute.data.value || message->attribute.data.size == 0) {
-			ESP_LOGW(TAG, "zb_attribute_handler: empty attribute payload");
-			return ESP_ERR_INVALID_ARG;
-		}
-		handle_rx_text((uint8_t*)message->attribute.data.value, message->attribute.data.size);
-	}
-
-	return ESP_OK;
-}
+/* Attribute-based handling removed: we use custom cluster command/char-string
+ * payloads instead of ZCL attributes for text exchange. */
 
 static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_message_t* message)
 {
@@ -395,8 +375,6 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void* message)
 {
 	switch (callback_id) {
-	case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
-		return zb_attribute_handler((const esp_zb_zcl_set_attr_value_message_t*)message);
 	case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
 		return zb_custom_cmd_handler((const esp_zb_zcl_custom_cluster_command_message_t*)message);
 	default:
@@ -465,7 +443,7 @@ static void zigbee_send_text_chunked(const char* text)
 					.src_endpoint = ZB_TEXT_ENDPOINT,
 				},
 				.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-				.cluster_id = ZB_CLUSTER_TEXT_SEND,
+				.cluster_id = ZB_CLUSTER_RAMSES_RX,
 				.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
 				.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
 				.custom_cmd_id = 0x00,
@@ -491,7 +469,7 @@ static void zigbee_send_text_chunked(const char* text)
 				/* clear any previous ACK state so stale acks don't match */
 				ctxt->last_ack_seq = 0;
 				ctxt->pending_ack_seq = (uint8_t)seq;
-			ESP_LOGI(TAG, "ZCL chunk queued: %u/%u bytes=%u tsn=%u", seq, total, (unsigned)chunk_len, (unsigned)tsn);
+			ESP_LOGD(TAG, "ZCL chunk queued: %u/%u bytes=%u tsn=%u", seq, total, (unsigned)chunk_len, (unsigned)tsn);
 
 			/* wait for application ACK */
 			TickType_t start = xTaskGetTickCount();
@@ -500,7 +478,7 @@ static void zigbee_send_text_chunked(const char* text)
 				if (ctxt->last_ack_seq == (uint8_t)seq) {
 					acked = true;
 					ctxt->pending_ack_seq = 0;
-					ESP_LOGI(TAG, "Received ACK for chunk %u/%u", seq, total);
+					ESP_LOGD(TAG, "Received ACK for chunk %u/%u", seq, total);
 					break;
 				}
 				vTaskDelay(pdMS_TO_TICKS(20));
@@ -542,6 +520,16 @@ static void zigbee_send_text_unacked(const char* text)
 		return;
 	}
 
+	/* If this is an application ACK ("ACK seq/total") send it as a
+	 * server command on the receive cluster (ZB_CLUSTER_TEXT_RECEIVE) so
+	 * it matches the cluster the coordinator expects for responses. For
+	 * other unacked payloads, use the send cluster (ZB_CLUSTER_TEXT_SEND).
+	 */
+	bool is_ack = false;
+	if (text_len >= 4 && strncmp(text, "ACK ", 4) == 0) {
+		is_ack = true;
+	}
+
 	esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
 		.zcl_basic_cmd = {
 			.dst_addr_u.addr_short = 0x0000,
@@ -549,10 +537,10 @@ static void zigbee_send_text_unacked(const char* text)
 			.src_endpoint = ZB_TEXT_ENDPOINT,
 		},
 		.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-		.cluster_id = ZB_CLUSTER_TEXT_SEND,
+		.cluster_id = is_ack ? ZB_CLUSTER_RAMSES_TX : ZB_CLUSTER_RAMSES_RX,
 		.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-		.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-		.custom_cmd_id = 0x00,
+		.direction = is_ack ? ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI : ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
+		.custom_cmd_id = is_ack ? 0x01 : 0x00,
 		.data = {
 			.type = ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
 			.value = NULL,
@@ -568,7 +556,7 @@ static void zigbee_send_text_unacked(const char* text)
 	if (tsn == 0xFF) {
 		ESP_LOGW(TAG, "ZCL unacked send failed: invalid TSN");
 	} else {
-		ESP_LOGI(TAG, "ZCL unacked send queued: %u bytes tsn=%u", (unsigned)text_len, (unsigned)tsn);
+		ESP_LOGD(TAG, "ZCL unacked send queued: %u bytes tsn=%u (ack=%d)", (unsigned)text_len, (unsigned)tsn, is_ack);
 	}
 }
 
@@ -643,7 +631,7 @@ static void Zigbee(void* param)
 		/* Drain RX first (always) */
 		struct zigbee_rx_msg rx_msg;
 		while (xQueueReceive(zigbee_rx_queue, &rx_msg, 0) == pdTRUE) {
-			ESP_LOGI(TAG, "Received Zigbee text: %s", rx_msg.text);
+			ESP_LOGD(TAG, "Received Zigbee text: %s", rx_msg.text);
 			if (!zigbee_handle_chunked_text(rx_msg.text)) {
 				/* Non-chunked message - send to RF only, echo comes from serial RX */
 				zigbee_tx_to_frame(rx_msg.text);
@@ -654,11 +642,11 @@ static void Zigbee(void* param)
 		struct zigbee_msg msg;
 		BaseType_t res = xQueueReceive(ctxt->queue, &msg, pdMS_TO_TICKS(20));
 		if (res == pdTRUE) {
-			ESP_LOGI(TAG, "Dequeued msg type=%d ready=%d", msg.type, ctxt->ready);
+			ESP_LOGD(TAG, "Dequeued msg type=%d ready=%d", msg.type, ctxt->ready);
 			switch (msg.type) {
 			case ZB_MSG_SENSOR_UPDATE:
 				if (ctxt->ready) {
-					ESP_LOGI(TAG, "Sending to Zigbee (fire-and-forget): %s", msg.text);
+					ESP_LOGD(TAG, "Sending to Zigbee (fire-and-forget)");
 					zigbee_send_text_chunked(msg.text);
 				} else {
 					ESP_LOGW(TAG, "Cannot send, not ready");
@@ -666,7 +654,7 @@ static void Zigbee(void* param)
 				break;
 			case ZB_MSG_SEND_UNACKED:
 				if (ctxt->ready) {
-					ESP_LOGI(TAG, "Sending unacked to Zigbee: %s", msg.text);
+					ESP_LOGD(TAG, "Sending unacked to Zigbee");
 					/* send directly without expecting application ACKs */
 					zigbee_send_text_unacked(msg.text);
 				} else {
@@ -674,7 +662,6 @@ static void Zigbee(void* param)
 				}
 				break;
 			case ZB_MSG_TX_TO_FRAME:
-				ESP_LOGI(TAG, "Received Zigbee text: %s", msg.text);
 				if (!zigbee_handle_chunked_text(msg.text)) {
 					zigbee_tx_to_frame(msg.text);
 				}
@@ -706,13 +693,14 @@ static void zigbee_stack_task(void* param)
 	esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
 	/* Cluster 0xFC00 as CLIENT (output) - sends custom commands to coordinator */
-	esp_zb_attribute_list_t* text_send_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_TEXT_SEND);
+	/* Cluster 0xFC00 as CLIENT (output) - RAMSES RX: ESP -> coordinator */
+	esp_zb_attribute_list_t* text_send_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_RAMSES_RX);
 	esp_zb_cluster_list_add_custom_cluster(cluster_list, text_send_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
-	esp_zb_attribute_list_t* text_recv_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_TEXT_RECEIVE);
-	esp_zb_custom_cluster_add_custom_attr(text_recv_cluster, ZB_ATTR_TEXT_STRING,
-										  ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
-										  received_text);
+	/* Cluster 0xFC01 as SERVER (input) - RAMSES TX: coordinator -> ESP */
+	esp_zb_attribute_list_t* text_recv_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_RAMSES_TX);
+	/* We don't add a ZCL attribute for the text payload; handle incoming
+	 * payloads via custom cluster command callbacks. */
 	esp_zb_cluster_list_add_custom_cluster(cluster_list, text_recv_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
 	esp_zb_attribute_list_t* identify_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY);
@@ -745,11 +733,9 @@ void ramses_zigbee_init(BaseType_t coreID)
 	ctxt->coreID = coreID;
 
 	esp_log_level_set(TAG, ESP_LOG_INFO);
-	/* Enable verbose Zigbee/ZBOSS logs for diagnosis (temporary) */
-	esp_log_level_set("esp_zb", ESP_LOG_DEBUG);
-	esp_log_level_set("zboss", ESP_LOG_DEBUG);
-	esp_log_level_set("ZIGBEE", ESP_LOG_DEBUG);
-	esp_log_level_set("ZIGBEE", ESP_LOG_DEBUG);
+	/* Reduce Zigbee stack verbosity by default; adjust for debugging when needed */
+	esp_log_level_set("esp_zb", ESP_LOG_INFO);
+	esp_log_level_set("zboss", ESP_LOG_INFO);
 	xTaskCreatePinnedToCore(zigbee_stack_task, "ZigbeeStack", 16384, NULL, 10, &ctxt->stack_task, ctxt->coreID);
 	xTaskCreatePinnedToCore(Zigbee, "Zigbee", 16384, ctxt, 5, &ctxt->task, ctxt->coreID);
 }
