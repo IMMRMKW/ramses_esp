@@ -1,6 +1,7 @@
 set(component_srcs
     "ramses_network.c" "network_cmd.c"
     "ramses_wifi.c" "wifi_cmd.c"
+    "zigbee_cmd.c"
     "ramses_ota.c" "ota_cmd.c"
     "ramses_sntp.c"
 )
@@ -8,7 +9,7 @@ set(component_srcs
 idf_component_register(
     SRCS "zigbee.c" "${component_srcs}"
     INCLUDE_DIRS "include" "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp-zigbee-lib/include" "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp-zboss-lib/include"
-    REQUIRES command nvs_flash esp_wifi esp_netif console mbedtls app_update esp_partition esp_https_ota esp_http_client message espressif__esp-zigbee-lib espressif__esp-zboss-lib
+    REQUIRES command nvs_flash esp_wifi esp_netif console mbedtls app_update esp_partition esp_https_ota esp_http_client message espressif__esp-zigbee-lib espressif__esp-zboss-lib ramses-buttons ramses-led
 )
 
 set(zigbee_target "${idf_target}")

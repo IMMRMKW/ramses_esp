@@ -21,9 +21,12 @@ static const char* TAG = "ZIGBEE";
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
+#include "esp_attr.h"   /* RTC_NOINIT_ATTR */
 
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zigbee_core.h"
+#include <ramses_buttons.h>
+#include "ramses_led.h"
 
 #include "message.h"
 #include "zigbee.h"
@@ -39,6 +42,14 @@ static const char* TAG = "ZIGBEE";
 #define ZB_CLUSTER_RAMSES_RX        0xFC00  /* RAMSES RX: ESP -> ZHA (client command) */
 #define ZB_CLUSTER_RAMSES_TX        0xFC01  /* RAMSES TX: ZHA -> ESP (client command) */
 
+
+/* RTC memory survives esp_restart() but is cleared on power-on/brown-out.
+ * We set this magic value before calling esp_zb_factory_reset() when the
+ * coordinator removed us (NOT a user-initiated factory reset).  On the
+ * subsequent DEVICE_FIRST_START we check it and skip automatic steering —
+ * the device waits for the user to explicitly trigger a join (button / CLI). */
+#define ZB_SKIP_AUTOJOIN_MAGIC  0xDEAD5A5A
+RTC_NOINIT_ATTR static uint32_t zb_skip_autojoin;
 
 #define INSTALLCODE_POLICY_ENABLE       false
 #define ED_AGING_TIMEOUT                ESP_ZB_ED_AGING_TIMEOUT_64MIN
@@ -177,6 +188,12 @@ struct zigbee_data {
 	/* Application-level ACK tracking */
 	volatile uint8_t last_ack_seq;
 	volatile uint8_t pending_ack_seq;
+
+	/* Set true when a factory-reset has been requested (via button or console
+	 * command).  The SIGNAL_LEAVE handler checks this flag to distinguish a
+	 * factory-reset Leave (→ call esp_zb_factory_reset() to erase zb_storage
+	 * and restart) from a coordinator-removal Leave. */
+	bool factory_reset_pending;
 };
 
 static struct zigbee_data* zigbee_ctxt(void);
@@ -582,10 +599,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
 		break;
 	case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
 	case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
-		/* End device: start network steering after initialization */
 		if (err_status == ESP_OK) {
-			zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
-			esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+			if (zb_skip_autojoin == ZB_SKIP_AUTOJOIN_MAGIC) {
+				/* Device was removed by coordinator in a previous session.
+				 * Do NOT auto-start steering: wait for explicit user action. */
+				zb_skip_autojoin = 0;
+				ESP_LOGW(TAG, "Removed by coordinator: waiting for user to trigger pair (button or 'zigbee pair')");
+				zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
+			} else {
+				/* Normal boot or user-initiated factory reset:
+				 * auto-start steering. */
+				zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
+				esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+									   ESP_ZB_BDB_MODE_NETWORK_STEERING, 2000);
+			}
 		}
 		break;
 	case ESP_ZB_BDB_SIGNAL_STEERING:
@@ -600,12 +627,130 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t* signal_struct)
 		break;
 	case ESP_ZB_ZDO_SIGNAL_LEAVE:
 		ctxt->ready = false;
-		zigbee_set_state(ctxt, ZIGBEE_STATE_ERROR);
-		esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
-			       ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+		if (ctxt->factory_reset_pending) {
+			/* Leave was triggered by our own factory reset request.
+			 * ZHA has now removed the device from its database.
+			 * Erase zb_storage and restart as a brand-new device. */
+			ESP_LOGW(TAG, "Factory-reset Leave confirmed: erasing zb_storage and restarting");
+			ctxt->factory_reset_pending = false;
+			esp_zb_factory_reset();
+			/* esp_zb_factory_reset() restarts — code below not reached */
+		} else if (ctxt->state == ZIGBEE_STATE_CONNECTED) {
+			/* Coordinator removed us while connected.
+			 * Set the RTC skip flag so that any future boot (power-cycle)
+			 * via DEVICE_REBOOT does NOT auto-start steering.
+			 * No wipe or restart needed: ZBOSS has already cleared its
+			 * internal network association (confirmed by zb_address_delete
+			 * in the trace).  Just go to idle PAIRING state and wait for
+			 * the user to explicitly trigger a re-pair. */
+			ESP_LOGW(TAG, "Removed by coordinator: going idle, waiting for user to trigger pair");
+			zb_skip_autojoin = ZB_SKIP_AUTOJOIN_MAGIC;
+			zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
+		} else {
+			/* Leave during PAIRING/ERROR: authentication rejected
+			 * (coordinator's permit-join is closed, or handshake failed
+			 * on a freshly-wiped device).  Nothing to wipe; retry steering. */
+			ESP_LOGW(TAG, "Auth rejected / transient Leave: retrying in 10s");
+			zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
+			esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+					   ESP_ZB_BDB_MODE_NETWORK_STEERING, 10000);
+		}
 		break;
 	default:
 		break;
+	}
+}
+
+/* Button-driven factory-reset: hold FUNC for 5s to factory-reset when not pairing */
+#define ZB_FACTORY_HOLD_MS (5000)
+
+static struct zb_reset_ctx {
+	StaticTimer_t timer_buf;
+	TimerHandle_t hTimer;
+	uint8_t expired;
+} zb_reset_ctx;
+
+static void zb_reset_timer_cb(TimerHandle_t xTimer)
+{
+	struct zb_reset_ctx* r = pvTimerGetTimerID(xTimer);
+	if (!r->expired) {
+		r->expired = 1;
+		struct zigbee_data* ctxt = zigbee_ctxt();
+		/* Notify the Zigbee app task — it will log and handle the reset.
+		 * Do NOT call ESP_LOG here: the Timer Service stack (~2 KB) is too
+		 * small for vfprintf and will overflow.  Use xTaskNotify (not the
+		 * FromISR variant) because timer callbacks run in task context. */
+		if (ctxt && ctxt->task) {
+			xTaskNotify(ctxt->task, 1, eSetBits);
+		}
+		/* If no task yet, silently ignore — no logging from timer context. */
+	}
+}
+
+static void enable_zb_reset(void)
+{
+	zb_reset_ctx.hTimer = xTimerCreateStatic("ZBReset", pdMS_TO_TICKS(ZB_FACTORY_HOLD_MS), pdFALSE, &zb_reset_ctx, zb_reset_timer_cb, &zb_reset_ctx.timer_buf);
+	zb_reset_ctx.expired = 0;
+}
+
+/* Pairing LED blink: use a single 100ms periodic timer and a tick counter
+ * to produce a 100ms ON every 1000ms (i.e. ON for 1 tick, OFF for 9 ticks).
+ */
+#define ZB_PAIR_TICK_MS (100)
+#define ZB_PAIR_TICKS_PER_PERIOD (10) /* 10 * 100ms = 1000ms */
+
+static struct pairing_blink {
+	StaticTimer_t timer_buf;
+	TimerHandle_t hTimer;
+	uint8_t tick;
+} pairing_blink;
+
+static void pairing_blink_cb(TimerHandle_t xTimer)
+{
+	(void)xTimer;
+	struct zigbee_data* ctxt = zigbee_ctxt();
+	if (!ctxt || ctxt->state != ZIGBEE_STATE_PAIRING) {
+		pairing_blink.tick = 0;
+		led_off(LED_RX);
+		return;
+	}
+
+	/* On tick 0 -> turn LED on for one tick, on tick 1..9 -> off */
+	if (pairing_blink.tick == 0) {
+		led_on(LED_RX);
+	} else if (pairing_blink.tick == 1) {
+		led_off(LED_RX);
+	}
+
+	pairing_blink.tick = (pairing_blink.tick + 1) % ZB_PAIR_TICKS_PER_PERIOD;
+}
+
+static void enable_pairing_blink(void)
+{
+	pairing_blink.tick = 0;
+	pairing_blink.hTimer = xTimerCreateStatic("ZBPair", pdMS_TO_TICKS(ZB_PAIR_TICK_MS), pdTRUE, &pairing_blink, pairing_blink_cb, &pairing_blink.timer_buf);
+}
+
+static void zigbee_button_cb(struct button_event* event)
+{
+	static int8_t level = -1;
+
+	if (!event)
+		return;
+
+	if (event->level != level) {
+		if (event->level == 0) { // pressed
+			zb_reset_ctx.expired = 0;
+			if (zb_reset_ctx.hTimer)
+				xTimerStart(zb_reset_ctx.hTimer, 0);
+		} else { // released
+			if (zb_reset_ctx.hTimer)
+				xTimerStop(zb_reset_ctx.hTimer, 0);
+			if (zb_reset_ctx.expired) {
+				/* timer already fired and handled factory reset */
+			}
+		}
+		level = event->level;
 	}
 }
 
@@ -628,6 +773,40 @@ static void Zigbee(void* param)
 	}
 
 	for (;;) {
+		/* Check for factory-reset notification from timer callback */
+		uint32_t notify_val = 0;
+		if (xTaskNotifyWait(0x00, 0xFFFFFFFF, &notify_val, 0) == pdTRUE) {
+			if (notify_val & 1) {
+				if (ctxt->state == ZIGBEE_STATE_CONNECTED) {
+					/* Device is on a network: send ZDO Leave so ZHA cleanly removes
+					 * the device, then SIGNAL_LEAVE → esp_zb_factory_reset(). */
+					ESP_LOGI(TAG, "Factory reset requested: sending ZDO Leave to coordinator");
+					ctxt->factory_reset_pending = true;
+					if (esp_zb_lock_acquire(pdMS_TO_TICKS(2000))) {
+						esp_zb_scheduler_alarm(
+								(esp_zb_callback_t)esp_zb_bdb_reset_via_local_action, 0, 100);
+						esp_zb_lock_release();
+						ESP_LOGI(TAG, "Factory reset: ZDO Leave scheduled");
+					} else {
+						ESP_LOGW(TAG, "Failed to acquire Zigbee lock for factory reset");
+						ctxt->factory_reset_pending = false;
+					}
+				} else {
+					/* Not connected (e.g. waiting after coordinator removal).
+					 * Just start steering — user wants to re-pair.
+					 * esp_zb_factory_reset() would wipe storage (already empty)
+					 * and restart, but simpler to just kick commissioning directly. */
+					ESP_LOGI(TAG, "Pair requested: starting NETWORK_STEERING");
+					zigbee_set_state(ctxt, ZIGBEE_STATE_PAIRING);
+					if (esp_zb_lock_acquire(pdMS_TO_TICKS(2000))) {
+						esp_zb_scheduler_alarm(
+								(esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+								ESP_ZB_BDB_MODE_NETWORK_STEERING, 100);
+						esp_zb_lock_release();
+					}
+				}
+			}
+		}
 		/* Drain RX first (always) */
 		struct zigbee_rx_msg rx_msg;
 		while (xQueueReceive(zigbee_rx_queue, &rx_msg, 0) == pdTRUE) {
@@ -677,6 +856,7 @@ static void Zigbee(void* param)
 static void zigbee_stack_task(void* param)
 {
 	(void)param;
+	struct zigbee_data* ctxt = zigbee_ctxt();
 	esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
 	esp_zb_init(&zb_nwk_cfg);
 
@@ -699,8 +879,6 @@ static void zigbee_stack_task(void* param)
 
 	/* Cluster 0xFC01 as SERVER (input) - RAMSES TX: coordinator -> ESP */
 	esp_zb_attribute_list_t* text_recv_cluster = esp_zb_zcl_attr_list_create(ZB_CLUSTER_RAMSES_TX);
-	/* We don't add a ZCL attribute for the text payload; handle incoming
-	 * payloads via custom cluster command callbacks. */
 	esp_zb_cluster_list_add_custom_cluster(cluster_list, text_recv_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
 	esp_zb_attribute_list_t* identify_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY);
@@ -720,8 +898,16 @@ static void zigbee_stack_task(void* param)
 
 	esp_zb_core_action_handler_register(zb_action_handler);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
-	/* Keep APS fragmentation disabled by default (use ZCL helper send).
-	 * Fragmentation was causing coordinator incompatibilities for our use-case. */
+
+	/* Enable button-driven factory-reset and register callback */
+	enable_zb_reset();
+	button_register(BUTTON_FUNC, zigbee_button_cb);
+
+	/* Enable pairing LED blink (timer created here) */
+	enable_pairing_blink();
+	if (pairing_blink.hTimer)
+		xTimerStart(pairing_blink.hTimer, 0);
+
 	ESP_ERROR_CHECK(esp_zb_start(false));
 
 	esp_zb_stack_main_loop();
@@ -732,10 +918,9 @@ void ramses_zigbee_init(BaseType_t coreID)
 	struct zigbee_data* ctxt = zigbee_ctxt();
 	ctxt->coreID = coreID;
 
-	esp_log_level_set(TAG, ESP_LOG_INFO);
-	/* Reduce Zigbee stack verbosity by default; adjust for debugging when needed */
-	esp_log_level_set("esp_zb", ESP_LOG_INFO);
-	esp_log_level_set("zboss", ESP_LOG_INFO);
+	/* Register console commands for Zigbee control */
+#include "zigbee_cmd.h"
+	zigbee_register();
 	xTaskCreatePinnedToCore(zigbee_stack_task, "ZigbeeStack", 16384, NULL, 10, &ctxt->stack_task, ctxt->coreID);
 	xTaskCreatePinnedToCore(Zigbee, "Zigbee", 16384, ctxt, 5, &ctxt->task, ctxt->coreID);
 }
@@ -748,6 +933,18 @@ void zigbee_update_sensor_text(const char* text)
 void zigbee_receive_text(const char* text)
 {
 	zigbee_queue_msg(ZB_MSG_TX_TO_FRAME, text);
+}
+
+/* Request a factory reset from any task.  Posts to the Zigbee app task so the
+ * actual ZBOSS scheduler call happens in task context with the Zigbee lock held. */
+void zigbee_request_factory_reset(void)
+{
+	struct zigbee_data* ctxt = zigbee_ctxt();
+	if (!ctxt || !ctxt->task) {
+		ESP_LOGW(TAG, "zigbee_request_factory_reset: task not ready");
+		return;
+	}
+	xTaskNotify(ctxt->task, 1, eSetBits);
 }
 
 zigbee_state_t zigbee_get_state(void)

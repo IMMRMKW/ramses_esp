@@ -671,6 +671,8 @@ CONFIG_MSG_LOG_LEVEL=2
 CONFIG_N_MSG=16
 # end of Message Configuration
 
+CONFIG_RAMSES_BUTTON_GPIO=9
+
 #
 # Debug Configuration
 #

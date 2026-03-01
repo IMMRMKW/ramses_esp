@@ -31,4 +31,8 @@ extern void zigbee_receive_text(const char* text);
 // Read current Zigbee state
 extern zigbee_state_t zigbee_get_state(void);
 
+// Request a factory reset: sends ZDO Leave to coordinator, erases Zigbee
+// NVRAM, and enters PAIRING state waiting for an explicit 'zigbee pair'.
+extern void zigbee_request_factory_reset(void);
+
 #endif // _ZIGBEE_H_
