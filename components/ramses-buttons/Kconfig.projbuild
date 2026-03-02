@@ -1,0 +1,5 @@
+config RAMSES_BUTTON_GPIO
+    int "Ramses FUNC button GPIO"
+    default 9
+    help
+      GPIO number used for the FUNC button (integer).

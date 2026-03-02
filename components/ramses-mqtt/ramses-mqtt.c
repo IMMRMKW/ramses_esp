@@ -35,7 +35,8 @@ static const char* TAG = "MQTT";
     MQTT_STATE(MQTT_START, "Start")         \
     MQTT_STATE(MQTT_STARTING, "Starting")   \
     MQTT_STATE(MQTT_CONNECTED, "Connected") \
-    MQTT_STATE(MQTT_ACTIVE, "Active")
+    MQTT_STATE(MQTT_ACTIVE, "Active")       \
+    MQTT_STATE(MQTT_DISCONNECTED, "Disconnected")
 
 #define MQTT_STATE(_e, _t) _e,
 enum mqtt_state {
@@ -71,6 +72,7 @@ struct mqtt_data {
     esp_mqtt_client_handle_t client;
 
     uint8_t info;
+    int wait_ticks;  /* reconnect backoff counter */
 };
 
 static struct mqtt_data* mqtt_ctxt(void)
@@ -271,10 +273,15 @@ static void mqtt_subscribe_cmd(struct mqtt_data* ctxt)
 
 static void mqtt_publish_cmd_result(struct mqtt_data* ctxt, char const* cmd, esp_err_t err, int retVal)
 {
-    char topic[192], data[128];
+    char topic[192];
+    char data[128];
 
-    sprintf(topic, "%s/cmd/result", ctxt->topic);
-    sprintf(data, "{ \"cmd\":\"%s\", \"err\":\"%s\", \"return\":%d} ", cmd, esp_err_to_name(err), retVal);
+    (void)snprintf(topic, sizeof(topic), "%s/cmd/result", ctxt->topic);
+    int n = snprintf(data, sizeof(data), "{ \"cmd\":\"%s\", \"err\":\"%s\", \"return\":%d} ", cmd ? cmd : "", esp_err_to_name(err), retVal);
+    if (n < 0) {
+        data[0] = '\0';
+    }
+    // snprintf guarantees NUL-termination; if truncated, publish the truncated string
     (void)esp_mqtt_client_publish(ctxt->client, topic, data, strlen(data), 0, 0);
 }
 
@@ -346,8 +353,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
         printf("# MQTT: Disonnected\n");
-        esp_restart();
-
+        mqtt_set_state(ctxt, MQTT_DISCONNECTED);
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -387,25 +393,48 @@ static void mqtt_state_machine(struct mqtt_data* ctxt)
 
     switch (ctxt->state) {
     case MQTT_IDLE:
-        if (mqtt_broker_configured(ctxt)) {
-            mqtt_set_state(ctxt, MQTT_WAIT);
-        }
+        mqtt_set_state(ctxt, MQTT_WAIT);
         break;
 
     case MQTT_WAIT:
-        if (wifi_is_connected())
+        if (ctxt->wait_ticks > 0) {
+            ctxt->wait_ticks--;
+        } else if (wifi_is_connected()) {
             mqtt_set_state(ctxt, MQTT_START);
+        }
         break;
 
     case MQTT_START:
+        if (!mqtt_broker_configured(ctxt)) {
+            /* No valid credentials yet — keep waiting */
+            ctxt->wait_ticks = 5000 / 50;
+            mqtt_set_state(ctxt, MQTT_WAIT);
+            break;
+        }
         char const* dev = device();
         if (dev[0]) {
-            sprintf(ctxt->topic, "%s/%s", ctxt->root, dev);
-            ctxt->client = esp_mqtt_client_init(&ctxt->cfg);
-            ESP_LOGI(TAG, "Connecting to %s", ctxt->cfg.broker.address.uri);
-            printf("# MQTT: Connecting to %s\n", ctxt->cfg.broker.address.uri);
-            esp_mqtt_client_register_event(ctxt->client, ESP_EVENT_ANY_ID, mqtt_event_handler, ctxt);
-            esp_mqtt_client_start(ctxt->client);
+            if (ctxt->client) {
+                /* Client exists from a previous connection — reconnect without
+                 * destroying it. Calling destroy() while esp_mqtt_task is still
+                 * running causes a crash (MEPC=0x00010008 race condition). */
+                ESP_LOGI(TAG, "Reconnecting to %s", ctxt->cfg.broker.address.uri);
+                printf("# MQTT: Reconnecting to %s\n", ctxt->cfg.broker.address.uri);
+                esp_mqtt_client_reconnect(ctxt->client);
+            } else {
+                /* Fresh start: create and start a new client. */
+                sprintf(ctxt->topic, "%s/%s", ctxt->root, dev);
+                ctxt->client = esp_mqtt_client_init(&ctxt->cfg);
+                if (!ctxt->client) {
+                    ESP_LOGE(TAG, "esp_mqtt_client_init failed");
+                    ctxt->wait_ticks = 5000 / 50;
+                    mqtt_set_state(ctxt, MQTT_WAIT);
+                    break;
+                }
+                ESP_LOGI(TAG, "Connecting to %s", ctxt->cfg.broker.address.uri);
+                printf("# MQTT: Connecting to %s\n", ctxt->cfg.broker.address.uri);
+                esp_mqtt_client_register_event(ctxt->client, ESP_EVENT_ANY_ID, mqtt_event_handler, ctxt);
+                esp_mqtt_client_start(ctxt->client);
+            }
             mqtt_set_state(ctxt, MQTT_STARTING);
         }
         break;
@@ -415,6 +444,7 @@ static void mqtt_state_machine(struct mqtt_data* ctxt)
 
     case MQTT_CONNECTED:
         printf("# MQTT: Connected\n");
+        ctxt->info = 0;  // re-publish firmware/version info on every (re)connect
         esp_mqtt_client_publish(ctxt->client, ctxt->topic, "online", strlen("online"), 1, 1);
         mqtt_subscribe_tx(ctxt);
         mqtt_publish_cmd(ctxt); // Clear old CMD
@@ -425,6 +455,17 @@ static void mqtt_state_machine(struct mqtt_data* ctxt)
     case MQTT_ACTIVE:
         if (ctxt->info < INFO_MAX)
             mqtt_publish_info(ctxt);
+        break;
+
+    case MQTT_DISCONNECTED:
+        /* Do NOT call stop()+destroy() here. The esp_mqtt_task is still running
+         * when this state is entered (the disconnect event was dispatched from
+         * within that task). Destroying the handle while the task runs causes
+         * a use-after-free crash (MEPC=0x00010008 / Instruction access fault).
+         * Instead we keep the client alive and use esp_mqtt_client_reconnect()
+         * in MQTT_START, which is safe to call from any context. */
+        ctxt->wait_ticks = 5000 / 50;
+        mqtt_set_state(ctxt, MQTT_WAIT);
         break;
 
     default:

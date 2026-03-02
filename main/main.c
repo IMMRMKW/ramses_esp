@@ -38,10 +38,13 @@
 
 void app_main(void)
 {
-    vTaskDelay(5 / portTICK_PERIOD_MS);
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
 
     const esp_app_desc_t* app = esp_app_get_description();
     printf("# %s %s\n", app->project_name, app->version);
+
+    esp_log_level_set("spi_master", ESP_LOG_WARN);
+    esp_log_level_set("bus_lock", ESP_LOG_WARN);
 
     // uint8_t platforms = platform();
     // if (platforms != PLATFORM_GW) // Don't change behaviour of pure gateway device'

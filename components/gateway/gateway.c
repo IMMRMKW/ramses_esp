@@ -23,6 +23,7 @@ static const char* TAG = "GATEWAY";
 #include "device.h"
 #include "gateway.h"
 #include "ramses-mqtt.h"
+#include "../ramses-network/include/zigbee.h"
 
 #define GWAY_CLASS 18
 #define GWAY_ID 730
@@ -105,6 +106,7 @@ static void gateway_radio_rx_func(void* param)
             if (msg_isValid(msg)) {
                 printf("%s\n", msgBuff);
                 MQTT_publish_rx(msg_get_ts(msg), msgBuff);
+                zigbee_update_sensor_text(msgBuff);
             } else {
                 ESP_LOGW(TAG, "Dropped <%s>", msgBuff);
             }

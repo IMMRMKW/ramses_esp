@@ -5,8 +5,11 @@ if(NOT DEFINED ENV{SDKCONFIG_DEFAULTS})
 	# Users can set SDKCONFIG_DEFAULTS env var (comma separated) in CI for different boards
 	set(ENV{SDKCONFIG_DEFAULTS} "sdkconfig.defaults")
 endif()
-
+# Ensure correct target (ESP32-C6)
+set(IDF_TARGET "esp32c6" CACHE INTERNAL "IDF target")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+# Match ZigbeeText minimal build to reduce component load
+idf_build_set_property(MINIMAL_BUILD ON)
 
 project(ramses_esp_c6)
 

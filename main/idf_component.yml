@@ -6,5 +6,7 @@ dependencies:
 # This requires reversal of a commit after installing v5.2.1
 # in the framework directory
 # git revert 04ac8e43dbaf37e42452fef034606ae3f04e644b  
+  espressif/esp-zboss-lib: "~1.6.0"
+  espressif/esp-zigbee-lib: "~1.6.0"
   idf: 
     version: ">=5.2.5"

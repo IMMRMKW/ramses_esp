@@ -15,8 +15,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "sdkconfig.h"
+
+#ifndef CONFIG_RAMSES_BUTTON_GPIO
+#define CONFIG_RAMSES_BUTTON_GPIO 9
+#endif
+
 #define _BUTTON_LIST \
-  _BUTTON(BUTTON_FUNC, "FUNC", 0 ) \
+  _BUTTON(BUTTON_FUNC, "FUNC", CONFIG_RAMSES_BUTTON_GPIO ) \
 
 #define _BUTTON( _e, _t, _i ) _e,
 enum buttons{ BUTTON_NONE, _BUTTON_LIST BUTTON_MAX };

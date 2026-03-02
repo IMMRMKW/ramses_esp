@@ -10,7 +10,11 @@
 #include "cmd.h"
 #include "network_cmd.h"
 
+#include "esp_system.h"
+#include "esp_log.h"
 #include "ramses_network.h"
+
+static const char* TAG = "NETWORK_CMD";
 
 /*********************************************************
  * MQTT Server commands
@@ -109,11 +113,70 @@ static int timezone_cmd( int argc, char **argv ) {
 }
 
 /*********************************************************
+ * Network mode commands
+ */
+
+static int net_cmd_mode_show(int argc, char** argv)
+{
+    printf("# Network mode: %s\n", NET_get_mode());
+    return 0;
+}
+
+static int net_cmd_mode_zigbee(int argc, char** argv)
+{
+    ESP_LOGI(TAG, "Setting network mode to zigbee, restarting...");
+    NET_set_mode("zigbee");
+    esp_restart();
+    return 0;  /* unreachable */
+}
+
+static int net_cmd_mode_wifi(int argc, char** argv)
+{
+    ESP_LOGI(TAG, "Setting network mode to wifi, restarting...");
+    NET_set_mode("wifi");
+    esp_restart();
+    return 0;  /* unreachable */
+}
+
+static esp_console_cmd_t const network_mode_cmds[] = {
+    {
+        .command = "zigbee",
+        .help = "Switch to Zigbee mode (saves to NVS and restarts)",
+        .hint = NULL,
+        .func = &net_cmd_mode_zigbee,
+    },
+    {
+        .command = "wifi",
+        .help = "Switch to WiFi+MQTT mode (saves to NVS and restarts)",
+        .hint = NULL,
+        .func = &net_cmd_mode_wifi,
+    },
+    {
+        .command = "show",
+        .help = "Show current network mode",
+        .hint = NULL,
+        .func = &net_cmd_mode_show,
+    },
+    { NULL_COMMAND }
+};
+
+static int net_cmd_network(int argc, char** argv)
+{
+    return cmd_menu(argc, argv, network_mode_cmds, argv[0]);
+}
+
+/*********************************************************
  * Top Level commands
  */
 
 void network_register(void) {
   static esp_console_cmd_t const net_cmds[] = {
+    {
+      .command = "network",
+      .help = "Network mode commands, enter 'network' for list",
+      .hint = NULL,
+      .func = &net_cmd_network,
+    },
     {
       .command = "mqtt",
       .help = "MQTT commands, enter 'mqtt' for list",

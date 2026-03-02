@@ -575,6 +575,9 @@ static struct frame_tx {
     uint8_t msgByte;
 } txFrm;
 
+static uint32_t tx_started_count = 0;
+static uint32_t tx_done_count = 0;
+
 static void frame_tx_reset(void)
 {
     memset(&txFrm, 0, sizeof(txFrm));
@@ -664,6 +667,8 @@ uint8_t frame_tx_byte(uint8_t* byte)
 
 static void frame_tx_done(void)
 {
+    tx_done_count++;
+    ESP_LOGI(TAG, "TX done count=%u bytes=%u", (unsigned)tx_done_count, txFrm.nBytes);
     msg_tx_done();
     frame_tx_reset();
 }
@@ -688,6 +693,9 @@ static void frame_tx_enable(void)
 {
     uart_disable();
     cc_enter_tx_mode();
+
+    tx_started_count++;
+    ESP_LOGI(TAG, "TX start count=%u bytes=%u", (unsigned)tx_started_count, txFrm.nBytes);
 
     frame.state = FRM_TX;
     txFrm.state = FRM_TX_IDLE;
