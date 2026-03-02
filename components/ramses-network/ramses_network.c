@@ -18,6 +18,7 @@
 #include "esp_netif.h"
 #include "nvs.h"
 
+#include "ramses-mqtt.h"
 #include "ramses_ota.h"
 #include "ramses_sntp.h"
 #include "ramses_wifi.h"
@@ -35,6 +36,10 @@ static const char* TAG = "NETWORK";
 #define SNTP_SERVER "sntp_server"
 #define TIMEZONE "timezone"
 
+#define NETWORK_MODE "net_mode"
+#define NET_MODE_ZIGBEE "zigbee"
+#define NET_MODE_WIFI    "wifi"
+
 #include "network_cmd.h"
 #include "ramses_network.h"
 
@@ -44,6 +49,8 @@ static const char* TAG = "NETWORK";
 
 struct network_data {
     nvs_handle_t nvs;
+
+    char net_mode[8];  /* "zigbee" or "wifi" — read from NVS at boot */
 
     size_t mqtt_broker_len;
     char* mqtt_broker;
@@ -349,6 +356,35 @@ void NET_set_timezone(char* new_timezone)
         net_set_timezone(ctxt, new_timezone);
 }
 
+/********************************************************************************
+ * Network mode (zigbee / wifi)
+ */
+
+static void net_get_mode(struct network_data* ctxt)
+{
+    size_t len = sizeof(ctxt->net_mode);
+    esp_err_t err = nvs_get_str(ctxt->nvs, NETWORK_MODE, ctxt->net_mode, &len);
+    if (err != ESP_OK)
+        strncpy(ctxt->net_mode, NET_MODE_ZIGBEE, sizeof(ctxt->net_mode));
+}
+
+void NET_set_mode(const char* mode)
+{
+    struct network_data* ctxt = network_ctxt();
+    if (!ctxt || !mode)
+        return;
+    strncpy(ctxt->net_mode, mode, sizeof(ctxt->net_mode) - 1);
+    ctxt->net_mode[sizeof(ctxt->net_mode) - 1] = '\0';
+    if (ctxt->nvs)
+        nvs_set_str(ctxt->nvs, NETWORK_MODE, ctxt->net_mode);
+}
+
+const char* NET_get_mode(void)
+{
+    struct network_data* ctxt = network_ctxt();
+    return ctxt ? ctxt->net_mode : NET_MODE_ZIGBEE;
+}
+
 void NET_show_timezones(void)
 {
     struct tz const* pTz = tz_list;
@@ -376,10 +412,21 @@ void ramses_network_init(BaseType_t coreID)
         net_get_mqtt_params(ctxt);
         net_get_sntp_server(ctxt);
         net_get_timezone(ctxt);
+        net_get_mode(ctxt);
+    } else {
+        strncpy(ctxt->net_mode, NET_MODE_ZIGBEE, sizeof(ctxt->net_mode));
     }
 
-    // ramses_sntp_init(coreID, ctxt->sntp_server);  // DISABLED - crashes if sntp_server is NULL
-    // ramses_ota_init(coreID);  // DISABLED for now
-    ramses_zigbee_init(coreID);
-    // ramses_wifi_init(coreID); // disabled for now
+    ESP_LOGI(TAG, "Network mode: %s", ctxt->net_mode);
+
+    if (strcmp(ctxt->net_mode, NET_MODE_WIFI) == 0) {
+        if (ctxt->sntp_server)
+            ramses_sntp_init(coreID, ctxt->sntp_server);
+        ramses_ota_init(coreID);
+        ramses_wifi_init(coreID);
+        ramses_mqtt_init(coreID);
+    } else {
+        /* Default: zigbee */
+        ramses_zigbee_init(coreID);
+    }
 }

@@ -2,9 +2,8 @@
 nvs,	data,	nvs,	0x9000,	0x6000,	
 phy_init,	data,	phy,	0xf000,	0x1000,	
 otadata,	data,	ota,	0x10000,	0x2000,	
-app0,	app,	ota_0,	0x20000,	0x140000,	
-app1,	app,	ota_1,	0x160000,	0x140000,	
-factory,	app,	factory,	0x2a0000,	0x140000,	
+app0,	app,	ota_0,	0x20000,	0x1e0000,	
+app1,	app,	ota_1,	0x200000,	0x1e0000,	
 zb_storage,	data,	fat,	0x3e0000,	16K,	
 zb_fct,	data,	fat,	0x3e4000,	1K,	
 

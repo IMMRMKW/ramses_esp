@@ -277,6 +277,10 @@ static void zigbee_set_state(struct zigbee_data* ctxt, zigbee_state_t new_state)
 {
 	if (ctxt && ctxt->state != new_state) {
 		ESP_LOGI(TAG, "state %s -> %s", zigbee_state_text(ctxt->state), zigbee_state_text(new_state));
+		if (new_state == ZIGBEE_STATE_CONNECTED)
+			printf("# ZIGBEE: Connected\n");
+		else if (ctxt->state == ZIGBEE_STATE_CONNECTED)
+			printf("# ZIGBEE: Disconnected\n");
 		ctxt->state = new_state;
 	}
 }
@@ -856,7 +860,6 @@ static void Zigbee(void* param)
 static void zigbee_stack_task(void* param)
 {
 	(void)param;
-	struct zigbee_data* ctxt = zigbee_ctxt();
 	esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
 	esp_zb_init(&zb_nwk_cfg);
 

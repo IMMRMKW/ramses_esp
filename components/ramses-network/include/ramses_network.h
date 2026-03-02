@@ -24,6 +24,11 @@ extern void NET_set_sntp_server( char *new_server );
 extern void NET_set_timezone( char *new_timezone );
 extern void NET_show_timezones( void);
 
+/* Network transport mode: "zigbee" (default) or "wifi".
+ * Changes are persisted to NVS and take effect after esp_restart(). */
+extern void        NET_set_mode( const char *mode );
+extern const char *NET_get_mode( void );
+
 extern void ramses_network_init( BaseType_t coreID );
 
 #endif // _RAMSES_NETWORK_H_
