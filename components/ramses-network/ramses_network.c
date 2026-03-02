@@ -365,7 +365,7 @@ static void net_get_mode(struct network_data* ctxt)
     size_t len = sizeof(ctxt->net_mode);
     esp_err_t err = nvs_get_str(ctxt->nvs, NETWORK_MODE, ctxt->net_mode, &len);
     if (err != ESP_OK)
-        strncpy(ctxt->net_mode, NET_MODE_ZIGBEE, sizeof(ctxt->net_mode));
+        strncpy(ctxt->net_mode, NET_MODE_WIFI, sizeof(ctxt->net_mode));
 }
 
 void NET_set_mode(const char* mode)
@@ -382,7 +382,7 @@ void NET_set_mode(const char* mode)
 const char* NET_get_mode(void)
 {
     struct network_data* ctxt = network_ctxt();
-    return ctxt ? ctxt->net_mode : NET_MODE_ZIGBEE;
+    return ctxt ? ctxt->net_mode : NET_MODE_WIFI;
 }
 
 void NET_show_timezones(void)
@@ -414,7 +414,7 @@ void ramses_network_init(BaseType_t coreID)
         net_get_timezone(ctxt);
         net_get_mode(ctxt);
     } else {
-        strncpy(ctxt->net_mode, NET_MODE_ZIGBEE, sizeof(ctxt->net_mode));
+        strncpy(ctxt->net_mode, NET_MODE_WIFI, sizeof(ctxt->net_mode));
     }
 
     ESP_LOGI(TAG, "Network mode: %s", ctxt->net_mode);
