@@ -285,13 +285,36 @@ static void mqtt_publish_cmd_result(struct mqtt_data* ctxt, char const* cmd, esp
     (void)esp_mqtt_client_publish(ctxt->client, topic, data, strlen(data), 0, 0);
 }
 
+static void mqtt_publish_cmd_result_str(struct mqtt_data* ctxt, char const* cmd, esp_err_t err, char const* retVal)
+{
+    char topic[192];
+    char data[128];
+
+    (void)snprintf(topic, sizeof(topic), "%s/cmd/result", ctxt->topic);
+    int n = snprintf(data, sizeof(data), "{ \"cmd\":\"%s\", \"err\":\"%s\", \"return\":\"%s\"} ", cmd ? cmd : "", esp_err_to_name(err), retVal ? retVal : "");
+    if (n < 0) {
+        data[0] = '\0';
+    }
+    (void)esp_mqtt_client_publish(ctxt->client, topic, data, strlen(data), 0, 0);
+}
+
 static void mqtt_process_cmd(struct mqtt_data* ctxt, char const* data, int dataLen)
 {
     if (dataLen > 0) {
         char cmdline[128];
-        sprintf(cmdline, "%.*s", dataLen, data); // Make sure cmdline contains trailing '\0'
+        snprintf(cmdline, sizeof(cmdline), "%.*s", dataLen, data); // Make sure cmdline contains trailing '\0'
 
-        int retVal;
+        // MQTT clients use !V as a gateway handshake and expect an evofw3-style string.
+        if (0 == strcmp(cmdline, "!V")) {
+            const esp_app_desc_t* app = esp_app_get_description();
+            char version[sizeof("# evofw3 ") + sizeof(app->version)];
+
+            (void)snprintf(version, sizeof(version), "# evofw3 %s", app->version);
+            mqtt_publish_cmd_result_str(ctxt, cmdline, ESP_OK, version);
+            return;
+        }
+
+        int retVal = 0;
         esp_err_t err = cmd_run(cmdline, &retVal);
 
         mqtt_publish_cmd_result(ctxt, cmdline, err, retVal);
