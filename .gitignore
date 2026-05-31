@@ -11,3 +11,9 @@ sdkconfig*.local
 .github/agents/
 .github/instructions/
 
+# Ignore Windows desktop metadata files
+desktop.ini
+
+# Local build artifact
+ramses_esp_esp32_c6.bin
+
