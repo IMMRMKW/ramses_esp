@@ -89,6 +89,7 @@ struct wifi_data {
 
     enum wifi_state state;
     int retry_num;
+    TickType_t retry_tick; /* when to start a fresh attempt after WIFI_FAILED */
 
     /* FreeRTOS event group to signal when we are connected*/
     EventGroupHandle_t event_group;
@@ -291,6 +292,21 @@ static void wifi_start(struct wifi_data* ctxt)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+/* Enter WIFI_FAILED and schedule the next automatic connection attempt. */
+static void wifi_enter_failed(struct wifi_data* ctxt)
+{
+    ctxt->state = WIFI_FAILED;
+    ctxt->retry_tick = xTaskGetTickCount() + pdMS_TO_TICKS(CONFIG_WIFI_RETRY_INTERVAL * 1000);
+}
+
+/* Tear down the current connection attempt and go back to reconnect. */
+static void wifi_begin_restart(struct wifi_data* ctxt)
+{
+    esp_wifi_stop();
+    ctxt->restart = false;
+    ctxt->state = WIFI_CREATED;
+}
+
 static void wifi_state_machine(struct wifi_data* ctxt)
 {
     EventBits_t bits = 0;
@@ -322,24 +338,35 @@ static void wifi_state_machine(struct wifi_data* ctxt)
         } else if (bits & WIFI_FAIL_BIT) {
             ESP_LOGI(TAG, "Failed to connect to SSID:%s", (char*)ctxt->station_config.sta.ssid);
             printf("# Failed to connect to SSID:%s\n", (char*)ctxt->station_config.sta.ssid);
-            ctxt->state = WIFI_FAILED;
+            wifi_enter_failed(ctxt);
             xEventGroupClearBits(ctxt->event_group, WIFI_FAIL_BIT);
         }
         break;
 
     case WIFI_FAILED:
-        if (ctxt->restart) {
-            esp_wifi_stop();
-            ctxt->restart = false;
-            ctxt->state = WIFI_CREATED;
+        /* Retry automatically once the interval has elapsed (wrap-safe), so a
+         * gateway that booted before its AP was ready recovers on its own.
+         * A manual `wifi restart` still forces an immediate attempt. */
+        {
+            bool due = ctxt->restart;
+#if CONFIG_WIFI_RETRY_INTERVAL > 0
+            due = due || (int32_t)(xTaskGetTickCount() - ctxt->retry_tick) >= 0;
+#endif
+            if (due)
+                wifi_begin_restart(ctxt);
         }
         break;
 
     case WIFI_CONNECTED:
         if (ctxt->restart) {
-            esp_wifi_stop();
-            ctxt->restart = false;
-            ctxt->state = WIFI_CREATED;
+            wifi_begin_restart(ctxt);
+        } else if (bits & WIFI_FAIL_BIT) {
+            /* Lost a previously-good connection and exhausted the immediate
+             * retries; fall back to the timed reconnect path. */
+            ESP_LOGI(TAG, "Lost connection to SSID:%s", (char*)ctxt->station_config.sta.ssid);
+            printf("# Lost connection to SSID:%s\n", (char*)ctxt->station_config.sta.ssid);
+            wifi_enter_failed(ctxt);
+            xEventGroupClearBits(ctxt->event_group, WIFI_FAIL_BIT);
         }
         break;
 
