@@ -51,6 +51,18 @@ menu "Network Configuration"
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
 
+    config WIFI_RETRY_INTERVAL
+        int "Reconnect interval (seconds)"
+        default 30
+        help
+            After the maximum number of immediate retries is exhausted, wait
+            this many seconds and then start a fresh connection attempt, and
+            keep doing so indefinitely. This lets a headless gateway recover
+            on its own when it booted before the AP was ready (e.g. after a
+            power cut) or when the AP disappears for a while. Set to 0 to
+            disable automatic retries (only the manual `wifi restart` command
+            will reconnect).
+
     choice WIFI_SCAN_AUTH_MODE_THRESHOLD
         prompt "WiFi Scan auth mode threshold"
         default WIFI_AUTH_WPA2_PSK
