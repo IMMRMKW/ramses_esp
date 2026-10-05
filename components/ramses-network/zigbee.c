@@ -25,6 +25,7 @@ static const char* TAG = "ZIGBEE";
 
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zigbee_core.h"
+#include "aps/esp_zigbee_aps.h"
 #include <ramses_buttons.h>
 #include "ramses_led.h"
 
@@ -34,9 +35,9 @@ static const char* TAG = "ZIGBEE";
 #define ZIGBEE_TEXT_MAX 256
 #define ZIGBEE_QUEUE_LEN 100  /* Increased to handle RF message bursts without drops */
 #define ZIGBEE_RX_QUEUE_LEN 8
-#define ZIGBEE_ZHA_MAX_STR_LEN 63
 #define ZIGBEE_ZHA_CHUNK_BODY_LEN 32  /* Reduced from 54 to prevent APS fragmentation */
-#define ZIGBEE_TX_CONFIRM_TIMEOUT_MS 5000  /* Watchdog: clear tx_busy if no confirm in 1s */
+#define ZIGBEE_TX_CONFIRM_TIMEOUT_MS 30000 /* Allow stack-owned APS retries to finish. */
+#define ZIGBEE_CHUNK_TIMEOUT_MS 35000
 
 #define ZB_TEXT_ENDPOINT            10
 #define ZB_CLUSTER_RAMSES_RX        0xFC00  /* RAMSES RX: ESP -> ZHA (client command) */
@@ -84,6 +85,7 @@ struct zigbee_chunk_state {
 	uint8_t total;
 	uint8_t next_seq;
 	size_t length;
+	TickType_t received_at;
 	char buffer[ZIGBEE_TEXT_MAX + 1];
 };
 
@@ -92,7 +94,6 @@ static struct zigbee_chunk_state chunk_state = {0};
 enum zigbee_msg_type {
 	ZB_MSG_SENSOR_UPDATE,
 	ZB_MSG_TX_TO_FRAME,
-	ZB_MSG_SEND_UNACKED,
 };
 
 static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text);
@@ -100,7 +101,7 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text);
 static bool zigbee_handle_chunked_text(const char* text);
 static void zigbee_tx_to_frame(const char* text);
 static void zigbee_send_text_chunked(const char* text);
-static void zigbee_send_text_unacked(const char* text);
+static void zigbee_drain_rx(void);
 static void zigbee_chunk_reset(void)
 {
 	chunk_state.active = false;
@@ -121,10 +122,7 @@ static bool zigbee_handle_chunked_text(const char* text)
 	if (sscanf(text, "%u/%u|%n", &seq, &total, &header_len) != 2 || header_len <= 0)
 		return false;
 
-	if (total <= 1)
-		return false;
-
-	if (seq == 0 || seq > total) {
+	if (total == 0 || total > 8 || seq == 0 || seq > total) {
 		ESP_LOGW(TAG, "Zigbee chunk invalid seq=%u total=%u", seq, total);
 		zigbee_chunk_reset();
 		return true;
@@ -134,8 +132,12 @@ static bool zigbee_handle_chunked_text(const char* text)
 	size_t body_len = strlen(body);
 	if (body_len == 0) {
 		ESP_LOGW(TAG, "Zigbee chunk %u/%u has empty body", seq, total);
+		zigbee_chunk_reset();
 		return true;
 	}
+
+	if (chunk_state.active && xTaskGetTickCount() - chunk_state.received_at >= pdMS_TO_TICKS(ZIGBEE_CHUNK_TIMEOUT_MS))
+		zigbee_chunk_reset();
 
 	if (!chunk_state.active || seq == 1) {
 		zigbee_chunk_reset();
@@ -144,7 +146,7 @@ static bool zigbee_handle_chunked_text(const char* text)
 		chunk_state.next_seq = 1;
 	}
 
-	if (chunk_state.next_seq != seq) {
+	if (chunk_state.total != total || chunk_state.next_seq != seq) {
 		ESP_LOGW(TAG, "Zigbee chunk out of order (expected %u got %u)", chunk_state.next_seq, seq);
 		zigbee_chunk_reset();
 		return true;
@@ -160,6 +162,7 @@ static bool zigbee_handle_chunked_text(const char* text)
 	chunk_state.length += body_len;
 	chunk_state.buffer[chunk_state.length] = '\0';
 	chunk_state.next_seq++;
+	chunk_state.received_at = xTaskGetTickCount();
 
 	if (seq == total) {
 		ESP_LOGD(TAG, "Zigbee chunk assembly complete (%u bytes)", (unsigned int)chunk_state.length);
@@ -182,12 +185,11 @@ struct zigbee_data {
 	QueueHandle_t queue;
 	zigbee_state_t state;
 	bool ready;
-	volatile bool tx_busy;  /* Single in-flight TX gate to prevent buffer pool exhaustion */
-	TickType_t tx_busy_timestamp;  /* Watchdog timestamp for tx_busy */
-
-	/* Application-level ACK tracking */
-	volatile uint8_t last_ack_seq;
-	volatile uint8_t pending_ack_seq;
+	bool tx_busy; /* Access only with the Zigbee lock held. */
+	uint8_t tx_tsn;
+	uint8_t tx_asdu[ZIGBEE_ZHA_CHUNK_BODY_LEN + 12];
+	size_t tx_asdu_len;
+	QueueHandle_t tx_confirm_queue;
 
 	/* Set true when a factory-reset has been requested (via button or console
 	 * command).  The SIGNAL_LEAVE handler checks this flag to distinguish a
@@ -210,7 +212,7 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 	strncpy(msg.text, text, sizeof(msg.text) - 1);
 	msg.text[sizeof(msg.text) - 1] = '\0';
 
-	ESP_LOGD(TAG, "Queuing msg type=%d ready=%d tx_busy=%d text=%s", type, ctxt->ready, ctxt->tx_busy, text);
+	ESP_LOGD(TAG, "Queuing msg type=%d ready=%d text=%s", type, ctxt->ready, text);
 
 	if (xPortInIsrContext()) {
 		BaseType_t higher_priority_woken = pdFALSE;
@@ -236,7 +238,8 @@ static void zigbee_enqueue_rx_text(const char* text, size_t len)
 		BaseType_t higher_priority_woken = pdFALSE;
 		xQueueSendFromISR(zigbee_rx_queue, &rx_msg, &higher_priority_woken);
 	} else {
-		xQueueSend(zigbee_rx_queue, &rx_msg, 0);
+		if (xQueueSend(zigbee_rx_queue, &rx_msg, 0) != pdTRUE)
+			ESP_LOGW(TAG, "Zigbee RX queue full, dropping command");
 	}
 }
 
@@ -247,7 +250,6 @@ static struct zigbee_data* zigbee_ctxt(void)
 		.state = ZIGBEE_STATE_IDLE,
 		.ready = false,
 		.tx_busy = false,
-		.tx_busy_timestamp = 0,
 	};
 	static struct zigbee_data* ctxt = NULL;
 	if (!ctxt) {
@@ -326,35 +328,10 @@ static void handle_rx_text(const uint8_t* data, uint16_t size)
 	memcpy(&received_text[1], data + 1, text_len);
 	received_text[text_len + 1] = '\0';
 
-	/* Fast-path: if this is an application ACK ("ACK <seq>/<total>")
-	 * consume it immediately and update pending state. ACKs must not be
-	 * enqueued as regular RX messages (they are control-plane only). */
-	const char* s = (const char*)&received_text[1];
-	if (strncmp(s, "ACK ", 4) == 0) {
-		unsigned int ack_seq = 0, ack_total = 0;
-		if (sscanf(s + 4, " %u/%u", &ack_seq, &ack_total) == 2) {
-			struct zigbee_data* ctxt = zigbee_ctxt();
-			if (ctxt) {
-				ctxt->last_ack_seq = (uint8_t)ack_seq;
-				ESP_LOGD(TAG, "ACK received for chunk %u/%u", ack_seq, ack_total);
-			}
-		}
-		return; /* do not enqueue ACKs */
-	}
-
-	/* Enqueue to RX queue for processing */
-	zigbee_enqueue_rx_text((const char*)&received_text[1], text_len);
-
-	/* If this looks like a chunk header (e.g. "1/3|...") -> queue an ACK
-	 * to the coordinator so sender can progress. We queue an unacked send
-	 * so the ACK is sent without expecting another ACK in return. */
-	int header_len = 0;
-	unsigned int seq = 0, total = 0;
-	if (sscanf(s, "%u/%u|%n", &seq, &total, &header_len) == 2 && header_len > 0) {
-		char ackbuf[32];
-		snprintf(ackbuf, sizeof(ackbuf), "ACK %u/%u", seq, total);
-		zigbee_queue_msg(ZB_MSG_SEND_UNACKED, ackbuf);
-	}
+	/* Ignore legacy control messages; APS now owns delivery acknowledgement. */
+	const char* text = (const char*)&received_text[1];
+	if (strncmp(text, "ACK ", 4) != 0)
+		zigbee_enqueue_rx_text(text, text_len);
 }
 
 /* Attribute-based handling removed: we use custom cluster command/char-string
@@ -403,184 +380,111 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 	}
 }
 
+/* The stack invokes this callback under its lock. Match the complete ASDU
+ * and endpoints, not merely a sequence number which can wrap. Other stack
+ * traffic must never release our single in-flight buffer. */
+static void zigbee_aps_confirm(esp_zb_apsde_data_confirm_t confirm)
+{
+	struct zigbee_data* ctxt = zigbee_ctxt();
+	if (!ctxt->tx_busy || confirm.dst_addr_mode != ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT ||
+		confirm.dst_addr.addr_short != 0x0000 || confirm.src_endpoint != ZB_TEXT_ENDPOINT ||
+		confirm.dst_endpoint != ZB_TEXT_ENDPOINT || !confirm.asdu ||
+		confirm.asdu_length != ctxt->tx_asdu_len ||
+		memcmp(confirm.asdu, ctxt->tx_asdu, ctxt->tx_asdu_len) != 0)
+		return;
+
+	ctxt->tx_busy = false;
+	xQueueOverwrite(ctxt->tx_confirm_queue, &confirm.status);
+}
+
 static void zigbee_send_text_chunked(const char* text)
 {
-	if (!text || text[0] == '\0')
+	if (!text || !*text)
 		return;
-
 	struct zigbee_data* ctxt = zigbee_ctxt();
-	if (!ctxt) {
-		ESP_LOGW(TAG, "No context, cannot send");
-		return;
-	}
-
 	size_t text_len = strlen(text);
-	if (text_len == 0)
+	if (text_len >= ZIGBEE_TEXT_MAX) {
+		ESP_LOGW(TAG, "Dropping oversized Zigbee message (%u bytes)", (unsigned)text_len);
 		return;
-
-	/* Ensure room for leading length byte and terminating NUL */
-	if (text_len > (ZIGBEE_TEXT_MAX - 1)) {
-		ESP_LOGW(TAG, "Text too long (%u bytes), truncating to %u", (unsigned)text_len, (unsigned)(ZIGBEE_TEXT_MAX - 1));
-		text_len = (ZIGBEE_TEXT_MAX - 1);
 	}
+	uint16_t total = (text_len + ZIGBEE_ZHA_CHUNK_BODY_LEN - 1) / ZIGBEE_ZHA_CHUNK_BODY_LEN;
+	for (uint16_t seq = 1; seq <= total; ++seq) {
+		size_t start = (seq - 1) * ZIGBEE_ZHA_CHUNK_BODY_LEN;
+		size_t body_len = text_len - start;
+		if (body_len > ZIGBEE_ZHA_CHUNK_BODY_LEN)
+			body_len = ZIGBEE_ZHA_CHUNK_BODY_LEN;
 
-	/* Chunk payload into header/body pieces: "seq/total|body" */
-	size_t body_cap = ZIGBEE_ZHA_CHUNK_BODY_LEN;
-	uint16_t total = (text_len + body_cap - 1) / body_cap;
-
-	for (uint16_t idx = 0; idx < total; ++idx) {
-		uint16_t seq = idx + 1;
-		size_t start = idx * body_cap;
-		size_t this_body = (start + body_cap <= text_len) ? body_cap : (text_len - start);
-
-		char chunk[ZIGBEE_TEXT_MAX + 1];
-		int header_len = snprintf(chunk, sizeof(chunk), "%u/%u|", seq, total);
-		if (header_len <= 0 || (size_t)header_len + this_body >= sizeof(chunk)) {
-			ESP_LOGW(TAG, "Chunk header too large, aborting");
+		if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+			ESP_LOGW(TAG, "Cannot acquire Zigbee lock, aborting message");
 			return;
 		}
-		memcpy(&chunk[header_len], &text[start], this_body);
-		chunk[header_len + this_body] = '\0';
-
-		/* Build ZCL char-string local buffer */
-		uint8_t local_sensor[ZIGBEE_TEXT_MAX + 1];
-		size_t chunk_len = (size_t)header_len + this_body;
-		local_sensor[0] = (uint8_t)chunk_len;
-		memcpy(&local_sensor[1], chunk, chunk_len);
-		local_sensor[1 + chunk_len] = '\0';
-
-		bool acked = false;
-		for (int attempt = 1; attempt <= 3 && !acked; ++attempt) {
-			if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-				ESP_LOGW(TAG, "Failed to acquire Zigbee lock for chunk %u/%u (attempt %d)", seq, total, attempt);
-				vTaskDelay(pdMS_TO_TICKS(50));
-				continue;
-			}
-
-			esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
-				.zcl_basic_cmd = {
-					.dst_addr_u.addr_short = 0x0000,
-					.dst_endpoint = ZB_TEXT_ENDPOINT,
-					.src_endpoint = ZB_TEXT_ENDPOINT,
-				},
-				.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-				.cluster_id = ZB_CLUSTER_RAMSES_RX,
-				.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-				.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-				.custom_cmd_id = 0x00,
-				.data = {
-					.type = ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
-					.value = NULL,
-					.size = (uint16_t)(chunk_len + 1),
-				},
-			};
-
-			cmd_req.data.value = (void*)local_sensor;
-			cmd_req.data.size = (uint16_t)(chunk_len + 1);
-			uint8_t tsn = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
+		if (ctxt->tx_busy) {
 			esp_zb_lock_release();
-
-			if (tsn == 0xFF) {
-				ESP_LOGW(TAG, "ZCL chunk send invalid TSN seq=%u total=%u attempt=%d", seq, total, attempt);
-				vTaskDelay(pdMS_TO_TICKS(50));
-				continue;
-			}
-
-			/* mark pending ack for this seq */
-				/* clear any previous ACK state so stale acks don't match */
-				ctxt->last_ack_seq = 0;
-				ctxt->pending_ack_seq = (uint8_t)seq;
-			ESP_LOGD(TAG, "ZCL chunk queued: %u/%u bytes=%u tsn=%u", seq, total, (unsigned)chunk_len, (unsigned)tsn);
-
-			/* wait for application ACK */
-			TickType_t start = xTaskGetTickCount();
-			TickType_t timeout = pdMS_TO_TICKS(ZIGBEE_TX_CONFIRM_TIMEOUT_MS);
-			while ((xTaskGetTickCount() - start) < timeout) {
-				if (ctxt->last_ack_seq == (uint8_t)seq) {
-					acked = true;
-					ctxt->pending_ack_seq = 0;
-					ESP_LOGD(TAG, "Received ACK for chunk %u/%u", seq, total);
-					break;
-				}
-				vTaskDelay(pdMS_TO_TICKS(20));
-			}
-
-			if (!acked) {
-				ESP_LOGW(TAG, "No ACK for chunk %u/%u attempt %d", seq, total, attempt);
-			}
-		}
-
-		if (!acked) {
-			ESP_LOGE(TAG, "Failed to send chunk %u/%u after retries, aborting message", seq, total);
+			ESP_LOGW(TAG, "Previous APS request still pending, dropping message");
 			return;
 		}
-
-		if (seq < total) {
-			vTaskDelay(pdMS_TO_TICKS(25));
-		}
-	}
-}
-
-/* Send a short text message without expecting an application-level ACK. */
-static void zigbee_send_text_unacked(const char* text)
-{
-	if (!text || text[0] == '\0')
-		return;
-
-	size_t text_len = strlen(text);
-	if (text_len > (ZIGBEE_TEXT_MAX - 1))
-		text_len = (ZIGBEE_TEXT_MAX - 1);
-
-	uint8_t local_sensor[ZIGBEE_TEXT_MAX + 1];
-	local_sensor[0] = (uint8_t)text_len;
-	memcpy(&local_sensor[1], text, text_len);
-	local_sensor[text_len + 1] = '\0';
-
-	if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
-		ESP_LOGW(TAG, "Failed to acquire Zigbee lock for unacked send");
-		return;
-	}
-
-	/* If this is an application ACK ("ACK seq/total") send it as a
-	 * server command on the receive cluster (ZB_CLUSTER_TEXT_RECEIVE) so
-	 * it matches the cluster the coordinator expects for responses. For
-	 * other unacked payloads, use the send cluster (ZB_CLUSTER_TEXT_SEND).
-	 */
-	bool is_ack = false;
-	if (text_len >= 4 && strncmp(text, "ACK ", 4) == 0) {
-		is_ack = true;
-	}
-
-	esp_zb_zcl_custom_cluster_cmd_req_t cmd_req = {
-		.zcl_basic_cmd = {
-			.dst_addr_u.addr_short = 0x0000,
+		xQueueReset(ctxt->tx_confirm_queue);
+		/* ZCL cluster-specific, client-to-server, disable default response.
+		 * Keep command 0 and the existing char-string wire format. */
+		ctxt->tx_asdu[0] = 0x11;
+		ctxt->tx_asdu[1] = ctxt->tx_tsn++;
+		ctxt->tx_asdu[2] = 0x00;
+		int header_len = snprintf((char*)&ctxt->tx_asdu[4], sizeof(ctxt->tx_asdu) - 4,
+				"%u/%u|", seq, total);
+		memcpy(&ctxt->tx_asdu[4 + header_len], text + start, body_len);
+		ctxt->tx_asdu[3] = header_len + body_len;
+		ctxt->tx_asdu_len = 4 + header_len + body_len;
+		esp_zb_apsde_data_req_t req = {
+			.dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+			.dst_addr.addr_short = 0x0000,
 			.dst_endpoint = ZB_TEXT_ENDPOINT,
 			.src_endpoint = ZB_TEXT_ENDPOINT,
-		},
-		.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-		.cluster_id = is_ack ? ZB_CLUSTER_RAMSES_TX : ZB_CLUSTER_RAMSES_RX,
-		.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-		.direction = is_ack ? ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI : ESP_ZB_ZCL_CMD_DIRECTION_TO_SRV,
-		.custom_cmd_id = is_ack ? 0x01 : 0x00,
-		.data = {
-			.type = ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
-			.value = NULL,
-			.size = (uint16_t)(text_len + 1),
-		},
-	};
+			.profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+			.cluster_id = ZB_CLUSTER_RAMSES_RX,
+			.asdu = ctxt->tx_asdu,
+			.asdu_length = ctxt->tx_asdu_len,
+			.tx_options = ESP_ZB_APSDE_TX_OPT_ACK_TX,
+		};
+		/* Arm before submitting: a fast confirm must not be lost. */
+		ctxt->tx_busy = true;
+		esp_err_t err = esp_zb_aps_data_request(&req);
+		if (err != ESP_OK)
+			ctxt->tx_busy = false;
+		esp_zb_lock_release();
+		if (err != ESP_OK) {
+			ESP_LOGW(TAG, "APS submit failed for chunk %u/%u: %s", seq, total, esp_err_to_name(err));
+			return;
+		}
 
-	cmd_req.data.value = (void*)local_sensor;
-	cmd_req.data.size = (uint16_t)(text_len + 1);
-	uint8_t tsn = esp_zb_zcl_custom_cluster_cmd_req(&cmd_req);
-	esp_zb_lock_release();
-
-	if (tsn == 0xFF) {
-		ESP_LOGW(TAG, "ZCL unacked send failed: invalid TSN");
-	} else {
-		ESP_LOGD(TAG, "ZCL unacked send queued: %u bytes tsn=%u (ack=%d)", (unsigned)text_len, (unsigned)tsn, is_ack);
+		TickType_t sent_at = xTaskGetTickCount();
+		uint8_t status;
+		for (;;) {
+			/* Keep coordinator-to-RF commands moving during APS retries. */
+			zigbee_drain_rx();
+			if (xQueueReceive(ctxt->tx_confirm_queue, &status, pdMS_TO_TICKS(20)) == pdTRUE)
+				break;
+			if (xTaskGetTickCount() - sent_at >= pdMS_TO_TICKS(ZIGBEE_TX_CONFIRM_TIMEOUT_MS)) {
+				/* Keep the gate closed until the late confirm arrives. Starting
+				 * another request here could exhaust the stack's buffer pool. */
+				ESP_LOGE(TAG, "APS confirm timeout for chunk %u/%u, aborting message", seq, total);
+				return;
+			}
+		}
+		if (status != 0) {
+			ESP_LOGW(TAG, "APS delivery failed for chunk %u/%u: 0x%02x", seq, total, status);
+			return; /* Stack owns retries; never blindly replay an RF command. */
+		}
 	}
 }
 
+static void zigbee_drain_rx(void)
+{
+	struct zigbee_rx_msg rx_msg;
+	while (xQueueReceive(zigbee_rx_queue, &rx_msg, 0) == pdTRUE) {
+		if (!zigbee_handle_chunked_text(rx_msg.text))
+			zigbee_tx_to_frame(rx_msg.text);
+	}
+}
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
@@ -811,17 +715,9 @@ static void Zigbee(void* param)
 				}
 			}
 		}
-		/* Drain RX first (always) */
-		struct zigbee_rx_msg rx_msg;
-		while (xQueueReceive(zigbee_rx_queue, &rx_msg, 0) == pdTRUE) {
-			ESP_LOGD(TAG, "Received Zigbee text: %s", rx_msg.text);
-			if (!zigbee_handle_chunked_text(rx_msg.text)) {
-				/* Non-chunked message - send to RF only, echo comes from serial RX */
-				zigbee_tx_to_frame(rx_msg.text);
-			}
-		}
+		zigbee_drain_rx();
 
-		/* Fire-and-forget TX: try to dequeue a TX message (short wait) and send immediately */
+		/* Send one message at a time, paced by APS delivery confirms. */
 		struct zigbee_msg msg;
 		BaseType_t res = xQueueReceive(ctxt->queue, &msg, pdMS_TO_TICKS(20));
 		if (res == pdTRUE) {
@@ -829,19 +725,10 @@ static void Zigbee(void* param)
 			switch (msg.type) {
 			case ZB_MSG_SENSOR_UPDATE:
 				if (ctxt->ready) {
-					ESP_LOGD(TAG, "Sending to Zigbee (fire-and-forget)");
+					ESP_LOGD(TAG, "Sending to Zigbee (APS acknowledged)");
 					zigbee_send_text_chunked(msg.text);
 				} else {
 					ESP_LOGW(TAG, "Cannot send, not ready");
-				}
-				break;
-			case ZB_MSG_SEND_UNACKED:
-				if (ctxt->ready) {
-					ESP_LOGD(TAG, "Sending unacked to Zigbee");
-					/* send directly without expecting application ACKs */
-					zigbee_send_text_unacked(msg.text);
-				} else {
-					ESP_LOGW(TAG, "Cannot send unacked, not ready");
 				}
 				break;
 			case ZB_MSG_TX_TO_FRAME:
@@ -900,6 +787,7 @@ static void zigbee_stack_task(void* param)
 	esp_zb_device_register(ep_list);
 
 	esp_zb_core_action_handler_register(zb_action_handler);
+	esp_zb_aps_data_confirm_handler_register(zigbee_aps_confirm);
 	esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
 
 	/* Enable button-driven factory-reset and register callback */
@@ -920,6 +808,11 @@ void ramses_zigbee_init(BaseType_t coreID)
 {
 	struct zigbee_data* ctxt = zigbee_ctxt();
 	ctxt->coreID = coreID;
+	ctxt->tx_confirm_queue = xQueueCreate(1, sizeof(uint8_t));
+	if (!ctxt->tx_confirm_queue) {
+		ESP_LOGE(TAG, "Cannot create APS confirm queue");
+		return;
+	}
 
 	/* Register console commands for Zigbee control */
 #include "zigbee_cmd.h"
