@@ -32,7 +32,10 @@ jobs:
       run: |
         set -e
         mkdir -p release
-        # We only want a single merged binary output; keep flash_args for merge step
+        # HTTPS OTA writes an application partition, not a merged flash image.
+        cp build/ramses_esp_c6.bin release/ramses_esp_c6.bin
+        sha256sum release/ramses_esp_c6.bin > release/ramses_esp_c6.bin.sha256
+        # Keep flash_args for the USB flash image merge step.
         cp build/flash_args release/ 2>/dev/null || true
 
     - name: Build single flash image
@@ -58,6 +61,8 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
+          release/ramses_esp_c6.bin
+          release/ramses_esp_c6.bin.sha256
           release/ramses_esp_esp32_c6.bin
           release/ramses_esp_esp32_c6.bin.sha256
         generate_release_notes: true
@@ -66,6 +71,7 @@ jobs:
         body: |
           Auto-generated release for ${{ github.ref_name }}.
           Single merged firmware image: ramses_esp_esp32_c6.bin
+          Wi-Fi OTA application image: ramses_esp_c6.bin
           Flash example (Linux/macOS):
             python -m esptool --chip esp32c6 write_flash 0x0 ramses_esp_esp32_c6.bin
           Flash example (Windows PowerShell):
