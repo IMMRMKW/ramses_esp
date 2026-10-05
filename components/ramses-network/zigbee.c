@@ -16,6 +16,8 @@
 static const char* TAG = "ZIGBEE";
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_system.h"
+#include "esp_random.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -38,6 +40,9 @@ static const char* TAG = "ZIGBEE";
 #define ZIGBEE_ZHA_CHUNK_BODY_LEN 32  /* Reduced from 54 to prevent APS fragmentation */
 #define ZIGBEE_TX_CONFIRM_TIMEOUT_MS 30000 /* Allow stack-owned APS retries to finish. */
 #define ZIGBEE_CHUNK_TIMEOUT_MS 35000
+#define ZIGBEE_NATIVE_CHUNK_LEN 30
+#define ZIGBEE_NATIVE_CMD 0x02
+#define ZIGBEE_NATIVE_MODE_CMD 0x03
 
 #define ZB_TEXT_ENDPOINT            10
 #define ZB_CLUSTER_RAMSES_RX        0xFC00  /* RAMSES RX: ESP -> ZHA (client command) */
@@ -51,6 +56,8 @@ static const char* TAG = "ZIGBEE";
  * the device waits for the user to explicitly trigger a join (button / CLI). */
 #define ZB_SKIP_AUTOJOIN_MAGIC  0xDEAD5A5A
 RTC_NOINIT_ATTR static uint32_t zb_skip_autojoin;
+#define ZB_NATIVE_WATCHDOG_MAGIC 0x41505332
+RTC_NOINIT_ATTR static uint32_t zb_native_watchdog_mode;
 
 #define INSTALLCODE_POLICY_ENABLE       false
 #define ED_AGING_TIMEOUT                ESP_ZB_ED_AGING_TIMEOUT_64MIN
@@ -74,6 +81,10 @@ RTC_NOINIT_ATTR static uint32_t zb_skip_autojoin;
 static uint8_t received_text[ZIGBEE_TEXT_MAX + 1] = {0};
 
 struct zigbee_rx_msg {
+	bool native;
+	uint32_t message_id;
+	uint8_t seq;
+	uint8_t total;
 	char text[ZIGBEE_TEXT_MAX];
 	size_t len;
 };
@@ -90,6 +101,13 @@ struct zigbee_chunk_state {
 };
 
 static struct zigbee_chunk_state chunk_state = {0};
+static struct zigbee_chunk_state native_chunk_state = {0};
+static uint32_t native_rx_message_id;
+static uint32_t native_rx_completed_id;
+static bool native_rx_completed;
+
+static void zigbee_handle_native_chunk(const struct zigbee_rx_msg* msg);
+
 
 enum zigbee_msg_type {
 	ZB_MSG_SENSOR_UPDATE,
@@ -185,6 +203,8 @@ struct zigbee_data {
 	QueueHandle_t queue;
 	zigbee_state_t state;
 	bool ready;
+	bool native_mode; /* Set by the coordinator; access under the Zigbee lock. */
+	uint32_t native_message_id;
 	bool tx_busy; /* Access only with the Zigbee lock held. */
 	uint8_t tx_tsn;
 	uint8_t tx_asdu[ZIGBEE_ZHA_CHUNK_BODY_LEN + 12];
@@ -205,6 +225,11 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 	struct zigbee_data* ctxt = zigbee_ctxt();
 	if (!ctxt || !ctxt->queue || !text)
 		return;
+	if (strnlen(text, ZIGBEE_TEXT_MAX) >= ZIGBEE_TEXT_MAX) {
+		if (!xPortInIsrContext())
+			ESP_LOGW(TAG, "Dropping oversized Zigbee message before enqueue");
+		return;
+	}
 
 	struct zigbee_msg msg = {
 		.type = type,
@@ -218,7 +243,8 @@ static void zigbee_queue_msg(enum zigbee_msg_type type, const char* text)
 		BaseType_t higher_priority_woken = pdFALSE;
 		xQueueSendFromISR(ctxt->queue, &msg, &higher_priority_woken);
 	} else {
-		xQueueSend(ctxt->queue, &msg, 0);
+		if (xQueueSend(ctxt->queue, &msg, 0) != pdTRUE)
+			ESP_LOGW(TAG, "Zigbee TX queue full, dropping message");
 	}
 }
 
@@ -229,7 +255,7 @@ static void zigbee_enqueue_rx_text(const char* text, size_t len)
 	if (len > ZIGBEE_TEXT_MAX - 1)
 		len = ZIGBEE_TEXT_MAX - 1;
 
-	struct zigbee_rx_msg rx_msg;
+	struct zigbee_rx_msg rx_msg = {0};
 	memcpy(rx_msg.text, text, len);
 	rx_msg.text[len] = '\0';
 	rx_msg.len = len;
@@ -353,6 +379,38 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 		return ESP_ERR_INVALID_ARG;
 	}
 
+	if (message->info.cluster == ZB_CLUSTER_RAMSES_TX &&
+		message->info.command.id == ZIGBEE_NATIVE_MODE_CMD) {
+		if (size != 1 || data[0] > 1)
+			return ESP_ERR_INVALID_ARG;
+		zigbee_ctxt()->native_mode = data[0] != 0;
+		return ESP_OK;
+	}
+	if (message->info.cluster == ZB_CLUSTER_RAMSES_TX &&
+		message->info.command.id == ZIGBEE_NATIVE_CMD) {
+		/* uint32 message ID (little-endian), seq, total, char-string. */
+		if (size < 8 || data[6] == 0 || data[6] > ZIGBEE_NATIVE_CHUNK_LEN ||
+			size != 7 + data[6] || data[4] == 0 || data[4] > data[5] || data[5] > 9)
+			return ESP_ERR_INVALID_ARG;
+		struct zigbee_rx_msg rx = {
+			.native = true,
+			.message_id = (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+				((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24),
+			.seq = data[4], .total = data[5], .len = data[6],
+		};
+		for (size_t i = 0; i < rx.len; ++i) {
+			if (data[7 + i] == 0 || data[7 + i] > 0x7f)
+				return ESP_ERR_INVALID_ARG;
+		}
+		memcpy(rx.text, data + 7, rx.len);
+		if (!zigbee_rx_queue || xQueueSend(zigbee_rx_queue, &rx, 0) != pdTRUE) {
+			ESP_LOGW(TAG, "Native Zigbee RX queue full, dropping chunk %u/%u", rx.seq, rx.total);
+			return ESP_ERR_NO_MEM;
+		}
+		zigbee_ctxt()->native_mode = true;
+		return ESP_OK;
+	}
+
 	/* If payload looks like a length-prefixed ZCL char-string, pass through */
 	if (size >= 1 && data[0] < size) {
 		handle_rx_text(data, size);
@@ -407,12 +465,18 @@ static void zigbee_send_text_chunked(const char* text)
 		ESP_LOGW(TAG, "Dropping oversized Zigbee message (%u bytes)", (unsigned)text_len);
 		return;
 	}
-	uint16_t total = (text_len + ZIGBEE_ZHA_CHUNK_BODY_LEN - 1) / ZIGBEE_ZHA_CHUNK_BODY_LEN;
+	if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000)))
+		return;
+	bool native = ctxt->native_mode;
+	uint32_t message_id = ++ctxt->native_message_id;
+	esp_zb_lock_release();
+	size_t body_cap = native ? ZIGBEE_NATIVE_CHUNK_LEN : ZIGBEE_ZHA_CHUNK_BODY_LEN;
+	uint16_t total = (text_len + body_cap - 1) / body_cap;
 	for (uint16_t seq = 1; seq <= total; ++seq) {
-		size_t start = (seq - 1) * ZIGBEE_ZHA_CHUNK_BODY_LEN;
+		size_t start = (seq - 1) * body_cap;
 		size_t body_len = text_len - start;
-		if (body_len > ZIGBEE_ZHA_CHUNK_BODY_LEN)
-			body_len = ZIGBEE_ZHA_CHUNK_BODY_LEN;
+		if (body_len > body_cap)
+			body_len = body_cap;
 
 		if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
 			ESP_LOGW(TAG, "Cannot acquire Zigbee lock, aborting message");
@@ -424,16 +488,26 @@ static void zigbee_send_text_chunked(const char* text)
 			return;
 		}
 		xQueueReset(ctxt->tx_confirm_queue);
-		/* ZCL cluster-specific, client-to-server, disable default response.
-		 * Keep command 0 and the existing char-string wire format. */
-		ctxt->tx_asdu[0] = 0x11;
+		/* Native command 2 is server-to-client, matching the quirk's
+		 * ClientCommandDefs. Keep the old command 0 direction unchanged. */
+		ctxt->tx_asdu[0] = native ? 0x19 : 0x11;
 		ctxt->tx_asdu[1] = ctxt->tx_tsn++;
-		ctxt->tx_asdu[2] = 0x00;
-		int header_len = snprintf((char*)&ctxt->tx_asdu[4], sizeof(ctxt->tx_asdu) - 4,
-				"%u/%u|", seq, total);
-		memcpy(&ctxt->tx_asdu[4 + header_len], text + start, body_len);
-		ctxt->tx_asdu[3] = header_len + body_len;
-		ctxt->tx_asdu_len = 4 + header_len + body_len;
+		ctxt->tx_asdu[2] = native ? ZIGBEE_NATIVE_CMD : 0x00;
+		if (native) {
+			for (unsigned i = 0; i < 4; ++i)
+				ctxt->tx_asdu[3 + i] = message_id >> (8 * i);
+			ctxt->tx_asdu[7] = seq;
+			ctxt->tx_asdu[8] = total;
+			ctxt->tx_asdu[9] = body_len;
+			memcpy(ctxt->tx_asdu + 10, text + start, body_len);
+			ctxt->tx_asdu_len = 10 + body_len;
+		} else {
+			int header_len = snprintf((char*)&ctxt->tx_asdu[4], sizeof(ctxt->tx_asdu) - 4,
+					"%u/%u|", seq, total);
+			memcpy(&ctxt->tx_asdu[4 + header_len], text + start, body_len);
+			ctxt->tx_asdu[3] = header_len + body_len;
+			ctxt->tx_asdu_len = 4 + header_len + body_len;
+		}
 		esp_zb_apsde_data_req_t req = {
 			.dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
 			.dst_addr.addr_short = 0x0000,
@@ -464,9 +538,13 @@ static void zigbee_send_text_chunked(const char* text)
 			if (xQueueReceive(ctxt->tx_confirm_queue, &status, pdMS_TO_TICKS(20)) == pdTRUE)
 				break;
 			if (xTaskGetTickCount() - sent_at >= pdMS_TO_TICKS(ZIGBEE_TX_CONFIRM_TIMEOUT_MS)) {
-				/* Keep the gate closed until the late confirm arrives. Starting
-				 * another request here could exhaust the stack's buffer pool. */
-				ESP_LOGE(TAG, "APS confirm timeout for chunk %u/%u, aborting message", seq, total);
+				/* The stack has failed to release its in-flight request.
+				 * Reboot to reclaim buffers rather than opening the gate
+				 * unsafely or remaining permanently blocked. */
+				ESP_LOGE(TAG, "APS confirm watchdog expired for chunk %u/%u; restarting", seq, total);
+				/* Preserve the negotiated wire format across this recovery. */
+				zb_native_watchdog_mode = native ? ZB_NATIVE_WATCHDOG_MAGIC : 0;
+				esp_restart();
 				return;
 			}
 		}
@@ -481,8 +559,48 @@ static void zigbee_drain_rx(void)
 {
 	struct zigbee_rx_msg rx_msg;
 	while (xQueueReceive(zigbee_rx_queue, &rx_msg, 0) == pdTRUE) {
+		if (rx_msg.native) {
+			zigbee_handle_native_chunk(&rx_msg);
+			continue;
+		}
 		if (!zigbee_handle_chunked_text(rx_msg.text))
 			zigbee_tx_to_frame(rx_msg.text);
+	}
+}
+
+static void zigbee_handle_native_chunk(const struct zigbee_rx_msg* msg)
+{
+	struct zigbee_chunk_state* state = &native_chunk_state;
+	if (native_rx_completed && msg->message_id == native_rx_completed_id)
+		return;
+	if (state->active && xTaskGetTickCount() - state->received_at >= pdMS_TO_TICKS(ZIGBEE_CHUNK_TIMEOUT_MS))
+		state->active = false;
+	if (msg->seq == 1 && (!state->active || native_rx_message_id != msg->message_id)) {
+		memset(state, 0, sizeof(*state));
+		state->active = true;
+		state->total = msg->total;
+		state->next_seq = 1;
+		native_rx_message_id = msg->message_id;
+	}
+	if (!state->active || native_rx_message_id != msg->message_id)
+		return;
+	if (msg->seq < state->next_seq)
+		return; /* Already accepted: do not execute duplicate RF commands. */
+	if (msg->total != state->total || msg->seq != state->next_seq || state->length + msg->len >= ZIGBEE_TEXT_MAX) {
+		ESP_LOGW(TAG, "Dropping incomplete native Zigbee message %08lx", (unsigned long)msg->message_id);
+		state->active = false;
+		return;
+	}
+	memcpy(state->buffer + state->length, msg->text, msg->len);
+	state->length += msg->len;
+	state->buffer[state->length] = 0;
+	state->next_seq++;
+	state->received_at = xTaskGetTickCount();
+	if (msg->seq == msg->total) {
+		native_rx_completed_id = msg->message_id;
+		native_rx_completed = true;
+		state->active = false;
+		zigbee_tx_to_frame(state->buffer);
 	}
 }
 
@@ -808,6 +926,9 @@ void ramses_zigbee_init(BaseType_t coreID)
 {
 	struct zigbee_data* ctxt = zigbee_ctxt();
 	ctxt->coreID = coreID;
+	ctxt->native_message_id = esp_random();
+	ctxt->native_mode = esp_reset_reason() == ESP_RST_SW && zb_native_watchdog_mode == ZB_NATIVE_WATCHDOG_MAGIC;
+	zb_native_watchdog_mode = 0;
 	ctxt->tx_confirm_queue = xQueueCreate(1, sizeof(uint8_t));
 	if (!ctxt->tx_confirm_queue) {
 		ESP_LOGE(TAG, "Cannot create APS confirm queue");

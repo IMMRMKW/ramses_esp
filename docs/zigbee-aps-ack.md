@@ -1,79 +1,103 @@
-# Zigbee delivery acknowledgements
+# Zigbee native delivery and message assembly
 
-The `feat/zigbee-aps-ack` firmware sends the existing command 0 on cluster
-0xFC00, endpoint 10, with the same length-prefixed ASCII `seq/total|body`
-payload. Bodies remain 32 bytes to avoid introducing APS fragmentation.
-The ESP explicitly requests an APS ACK and waits for its APS data-confirm
-callback before submitting another chunk. It disables ZCL default responses
-and no longer sends or waits for ASCII `ACK seq/total` commands.
+This development branch uses native APS delivery confirmations rather than
+ASCII `ACK seq/total` traffic. A complete RF message is serialized into chunks;
+the next chunk is submitted only after the current APS request confirms success.
+ZCL default responses are disabled. APS confirmation means arrival at the peer's
+Zigbee stack, not Home Assistant consumption or RF execution.
 
-One request is in flight at a time. Pending state is armed before submission,
-and confirmations are matched against the destination, endpoints and complete
-ASDU. A delivery failure aborts the message; APS owns retransmission. A timeout
-does not release the buffer gate until the actual confirmation arrives. If no
-confirmation ever arrives, transmission stays blocked until reboot rather
-than overflowing the stack's buffers. Incoming RF commands are processed while
-the task waits. Chunk assembly also rejects inconsistent totals and expires
-incomplete messages after 35 seconds.
+## Wire format and ZHA quirk
 
-## Host compatibility
+Endpoint 10 and clusters 0xFC00 (ESP to host) / 0xFC01 (host to ESP) stay the same.
+The updated ELECRAM quirk defines these commands:
 
-Use the corresponding `ramses_rf` transport branch through `ramses_cc`, and
-append `?ack=aps` to the bridge URL:
+| Command | Purpose | Payload |
+| --- | --- | --- |
+| 0x00 | Legacy text | ZCL char-string, existing ASCII chunk header |
+| 0x01 | Legacy ASCII ACK | ZCL char-string |
+| 0x02 | Native identified chunk | uint32 message ID, uint8 sequence, uint8 total, char-string body |
+| 0x03 | Select native mode (host to ESP) | Boolean |
+
+Native chunks have at most 30 ASCII body bytes. The binary ID/sequence/total
+fields take six bytes and the char-string length takes one. Including the
+three-byte ZCL header, the ASDU is at most 40 bytes. The quirk explicitly
+disables the manufacturer header for native commands, matching the firmware.
+The ESP emits native command 2 with server-to-client direction (frame control
+0x19). Host writes use client-to-server direction (0x11). The quirk also decodes
+legacy command 0 with its existing client-to-server direction.
+The quirk matches both the deployed device type 0x0000 and the current
+firmware's simple-sensor descriptor (0x000C).
+
+The host selects native mode at connection and reconnection with command 3.
+Receiving a native data command also enables native mode on the firmware.
+Until selected, the ESP retains its original command-0 text format, using APS
+confirmation to pace transmission. Legacy command definitions are retained
+so already deployed firmware and hosts can still use their text/ACK protocol.
+Native mode lasts until reboot or command 3 disables it. A watchdog recovery
+preserves the negotiated mode in RTC memory; a power cycle selects legacy
+until the host negotiates or sends native data again.
+
+## Missing messages and recovery
+
+- Each complete native message receives its own 32-bit ID. Counters start from
+  a random value at boot/transport creation to reduce reuse across restarts.
+- Receivers require chunk 1 to start a message. Subsequent chunks must match
+  its ID, total and expected next sequence. A mismatched ID is ignored; a gap
+  or inconsistent total aborts the incomplete message. A new first chunk can
+  replace an incomplete predecessor without combining their bytes.
+- Accepted duplicate chunks are ignored. Repeated delivery of the most
+  recently completed ID is ignored. This is not persistent exactly-once RF
+  execution across reboots or arbitrary replay histories.
+- Partial assembly expires after 35 seconds. Only a complete message reaches
+  the RF parser or Home Assistant RAMSES parser.
+- An APS delivery failure aborts the outgoing message. Neither endpoint
+  blindly retries the whole RF command through alternate command APIs.
+- The host waits at most 35 seconds for each native delivery; failure releases
+  its write lock so another message can proceed with a different ID.
+- If the ESP receives no APS confirmation for 30 seconds, it reboots to
+  reclaim stack buffers. Opening the in-flight gate without releasing the
+  stack's request would be unsafe. Recovery can lose queued messages.
+- The ESP processes incoming commands while waiting for APS confirmation.
+
+Yes, messages can be dropped after exhausted delivery retries, incomplete
+assembly, oversized/malformed input, bounded queue overflow or restart. APS
+cannot acknowledge application queue capacity. The old ASCII ACK was also
+sent before full message validation/execution, so it was not an end-to-end
+execution guarantee. RF echoes and RAMSES replies remain the end-to-end
+signals. Traffic is not stored durably during outages.
+
+## Installation and traffic
+
+Install the coordinated firmware, `ramses_rf` transport changes and updated
+ELECRAM quirk. Then configure through `ramses_cc`:
 
 ```text
 zigbee://<ieee>/0xfc00/0x0000/10/0xfc01/0x0000/10?ack=aps
 ```
 
-The host requests APS ACKs (`ask_for_ack=True`), disables ZCL default
-responses and does not generate ASCII ACKs. Complete outgoing frames are
-serialized so concurrent requests cannot interleave chunks. A failed chunk
-stops the frame instead of sending the remaining pieces or probing alternate
-command APIs after an uncertain delivery.
+The stable dependency pin in `ramses_cc` still needs a published transport
+version or accessible immutable commit before deployment. A missing updated
+quirk produces a clear transport initialization error. APS mode is not for
+old firmware that waits for ASCII ACKs. The device-selection UI keeps legacy
+URLs because it cannot identify firmware capability.
 
-URLs without `ack=aps` keep the host's legacy behaviour for older firmware.
-The new firmware ignores legacy ACK text, so an older host can still receive
-its messages, but it will continue producing unnecessary control traffic.
-Do not select APS mode with old firmware: that firmware still waits for ASCII
-ACKs and will time out. The existing ZHA quirk's command definitions remain
-usable; removing its unused ACK commands can be a later coordinated change.
+Native IDs add overhead, offset by removing one ASCII ACK command per chunk.
+For example, 96 ASCII characters need four 30-byte native chunks, versus three
+32-byte legacy data commands plus three ASCII ACK commands. MAC/APS ACKs and
+stack retries still use airtime; this is not a claim of halving total airtime.
+Capture traffic during RF bursts and discovery to quantify the actual saving.
 
-## Traffic and delivery guarantees
+## Validation
 
-For an N-chunk message, the old protocol adds N ASCII ACK commands. APS mode
-removes those commands; it still uses MAC/APS acknowledgements and stack
-retries. For example, a 96-character message has three 32-character chunks:
-three data commands instead of three data plus three ASCII ACK commands.
-This halves custom application commands, not total airtime.
+The firmware builds with ESP-IDF 5.5.2, esp-zigbee-lib 1.6.8 and esp-zboss-lib
+1.6.4. Host tests cover message isolation, missing/late/duplicate chunks,
+timeouts, ordered concurrent writes and payload bounds. Quirk tests verify
+the exact native wire bytes and legacy decoding.
 
-The reviewer's question about bandwidth is reasonable, but the PR's stated
-rate of one message per 1–2 minutes is not evidence of network saturation.
-Capture real traffic during discovery, RF bursts and retries before making a
-network-capacity claim. ASCII remains useful because the bridge transports an
-existing RAMSES serial protocol rather than exposing each RF device as a
-separate Zigbee device. Binary encoding or larger chunks are separate changes.
-
-An APS ACK confirms delivery to the remote Zigbee stack. It does not confirm
-Home Assistant consumption, queue acceptance, RF transmission or a response
-from the heating/ventilation device. RF echoes and RAMSES replies remain the
-end-to-end signals. The RX queue is bounded; APS cannot prevent application
-queue overflow. An explicit ZCL default response would be needed to convey
-application acceptance/errors if that guarantee is required.
-
-## Validation before deployment
-
-- Build on ESP-IDF 5.5.2 with esp-zigbee-lib 1.6.8 and esp-zboss-lib 1.6.4.
-- Run the transport tests, including real zigpy command serialization,
-  delivery pacing, failed-delivery abortion and concurrent-frame ordering.
-- On hardware, capture both directions and verify APS ACK requests, absence
-  of ASCII ACK commands and default responses, RF echoes and multi-chunk data.
-- Test a coordinator outage, a dropped chunk and RF bursts. Confirm that
-  unrelated APS confirmations cannot advance the next chunk and that the
-  stack resumes safely after a late confirmation.
-- Measure queue drops and packet/airtime counts on the intended Zigbee network.
-
-The automated build and host tests do not validate over-the-air SDK callback
-behaviour. This branch needs hardware testing before release.
+Hardware testing remains required: verify actual APS confirms, remove the
+coordinator during transfer, exercise queue overflow and the watchdog, and
+capture that incomplete messages never become RF commands. Tests do not prove
+over-the-air SDK behaviour or eliminate packet loss.
 
 References:
 - [ZHA review](https://github.com/zigpy/zha-device-handlers/pull/4782#issuecomment-4016569965)
