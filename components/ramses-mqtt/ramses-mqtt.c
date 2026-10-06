@@ -25,6 +25,7 @@ static const char* TAG = "MQTT";
 #include "gateway.h"
 #include "ramses-mqtt.h"
 #include "ramses_wifi.h"
+#include "mqtt_update.h"
 
 /****************************************************
  * States
@@ -333,6 +334,8 @@ enum topics {
 
 static void mqtt_process_data(struct mqtt_data* ctxt, esp_mqtt_event_handle_t event)
 {
+    if (mqtt_update_command(event)) return;
+    if (!event->topic || event->topic_len <= strlen(ctxt->topic) + 1) return;
     static struct topic {
         char const* topic;
         void (*func)(struct mqtt_data* ctxt, char const* data, int dataLen);
@@ -472,6 +475,7 @@ static void mqtt_state_machine(struct mqtt_data* ctxt)
         mqtt_subscribe_tx(ctxt);
         mqtt_publish_cmd(ctxt); // Clear old CMD
         mqtt_subscribe_cmd(ctxt);
+        mqtt_update_connected(ctxt->client, ctxt->topic);
         mqtt_set_state(ctxt, MQTT_ACTIVE);
         break;
 

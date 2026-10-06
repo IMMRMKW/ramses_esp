@@ -9,6 +9,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
 static const char* TAG = "OTA";
 #include "esp_log.h"
@@ -24,6 +25,8 @@ static const char* TAG = "OTA";
 
 #include "ota_cmd.h"
 #include "ramses_ota.h"
+#include "firmware_update.h"
+extern void mqtt_update_progress(bool active, int percent);
 
 struct ota_data {
     BaseType_t coreID;
@@ -35,6 +38,7 @@ struct ota_data {
 
     esp_https_ota_handle_t ota_handle;
 };
+static portMUX_TYPE ota_config_lock = portMUX_INITIALIZER_UNLOCKED;
 
 struct ota_data* ota_ctxt(void)
 {
@@ -104,6 +108,9 @@ static esp_err_t ota_check_file_hdr(struct ota_data* ctxt)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_https_ota_read_img_desc failed");
     } else {
+        if (strcmp(app_info.project_name, "ramses_esp_c6")) return ESP_ERR_INVALID_ARG;
+        if (strcmp(ctxt->version, "latest") && strcmp(ctxt->version, app_info.version))
+            return ESP_ERR_INVALID_VERSION;
         esp_app_desc_t running_app_info;
         const esp_partition_t* running = esp_ota_get_running_partition();
         err = esp_ota_get_partition_description(running, &running_app_info);
@@ -138,6 +145,8 @@ static esp_err_t ota_download_file(struct ota_data* ctxt)
 
     while (1) {
         err = esp_https_ota_perform(ctxt->ota_handle);
+        int size = esp_https_ota_get_image_size(ctxt->ota_handle);
+        if (size > 0) mqtt_update_progress(true, (int)((int64_t)esp_https_ota_get_image_len_read(ctxt->ota_handle) * 100 / size));
         if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
             break;
         }
@@ -156,6 +165,7 @@ static esp_err_t ota_finish(struct ota_data* ctxt)
         printf("# OTA: complete data was not received\n");
     } else {
         err = esp_https_ota_finish(ctxt->ota_handle);
+        ctxt->ota_handle = NULL;
         if (err != ESP_OK) {
             if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
                 ESP_LOGE(TAG, "Image validation failed, image is corrupted");
@@ -190,7 +200,6 @@ static void Ota(void* param)
     if (!strcmp(ctxt->version, "latest")) {
         sprintf(url, "%s/%s/download/%s", ctxt->url, ctxt->version, ctxt->filename);
     } else {
-        ctxt->force = 1; // Always update with a specific version
         sprintf(url, "%s/download/%s/%s", ctxt->url, ctxt->version, ctxt->filename);
     }
     ESP_LOGI(TAG, "URL <%s>", url);
@@ -202,9 +211,11 @@ static void Ota(void* param)
             err = ota_download_file(ctxt);
         if (err == ESP_OK)
             err = ota_finish(ctxt);
-        if (err != ESP_OK)
+        if (err != ESP_OK && ctxt->ota_handle)
             esp_https_ota_abort(ctxt->ota_handle);
     }
+    ctxt->ota_handle = NULL;
+    free(ctxt);
 
     if (err == ESP_OK) {
         printf("# OTA: Upgrade complete. Rebooting ...\n");
@@ -212,6 +223,8 @@ static void Ota(void* param)
         vTaskDelay(1000 / portTICK_PERIOD_MS);
         esp_restart();
     } else {
+        mqtt_update_progress(false, 0);
+        firmware_update_release();
         vTaskDelete(NULL);
     }
 }
@@ -222,26 +235,45 @@ static void Ota(void* param)
 void ota_set_url(const char* url)
 {
     struct ota_data* ctxt = ota_ctxt();
-    strncpy(ctxt->url, url, sizeof(ctxt->url) - 1);
+    portENTER_CRITICAL(&ota_config_lock);
+    strlcpy(ctxt->url, url, sizeof(ctxt->url));
+    portEXIT_CRITICAL(&ota_config_lock);
 }
 
 void ota_set_version(const char* version)
 {
     struct ota_data* ctxt = ota_ctxt();
-    strncpy(ctxt->version, version, sizeof(ctxt->version) - 1);
+    portENTER_CRITICAL(&ota_config_lock);
+    strlcpy(ctxt->version, version, sizeof(ctxt->version));
+    portEXIT_CRITICAL(&ota_config_lock);
 }
 
 void ota_set_filename(const char* filename)
 {
     struct ota_data* ctxt = ota_ctxt();
-    strncpy(ctxt->filename, filename, sizeof(ctxt->filename) - 1);
+    portENTER_CRITICAL(&ota_config_lock);
+    strlcpy(ctxt->filename, filename, sizeof(ctxt->filename));
+    portEXIT_CRITICAL(&ota_config_lock);
 }
 
 void ota_start(uint8_t force)
 {
-    struct ota_data* ctxt = ota_ctxt();
+    if (!firmware_update_claim()) return;
+    struct ota_data* ctxt = malloc(sizeof(*ctxt));
+    if (!ctxt) {
+        firmware_update_release();
+        return;
+    }
+    portENTER_CRITICAL(&ota_config_lock);
+    *ctxt = *ota_ctxt();
+    portEXIT_CRITICAL(&ota_config_lock);
     ctxt->force = force;
-    xTaskCreatePinnedToCore(Ota, "OTA", 8 * 1024, ctxt, 5, NULL, ctxt->coreID);
+    mqtt_update_progress(true, 0);
+    if (xTaskCreatePinnedToCore(Ota, "OTA", 8 * 1024, ctxt, 5, NULL, ctxt->coreID) != pdPASS) {
+        mqtt_update_progress(false, 0);
+        firmware_update_release();
+        free(ctxt);
+    }
 }
 
 /********************************************************************/

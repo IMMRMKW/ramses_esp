@@ -26,6 +26,7 @@ jobs:
         path: .
         command: >-
           rm -f sdkconfig && export SDKCONFIG_DEFAULTS=sdkconfig.defaults &&
+          export RAMSES_RELEASE_VERSION=$(git describe --tags --exact-match 2>/dev/null || git describe --tags --always) &&
           idf.py set-target esp32c6 && idf.py reconfigure && idf.py build
 
     - name: Create firmware package
@@ -37,6 +38,12 @@ jobs:
         sha256sum release/ramses_esp_c6.bin > release/ramses_esp_c6.bin.sha256
         # Keep flash_args for the USB flash image merge step.
         cp build/flash_args release/ 2>/dev/null || true
+
+    - name: Package OTA images and catalogues
+      if: startsWith(github.ref, 'refs/tags/')
+      env:
+        RELEASE_VERSION: ${{ github.ref_name }}
+      run: python tools/package_ota.py --version "$RELEASE_VERSION"
 
     - name: Build single flash image
       run: |
@@ -63,6 +70,10 @@ jobs:
         files: |
           release/ramses_esp_c6.bin
           release/ramses_esp_c6.bin.sha256
+          release/ramses_esp_c6.ota
+          release/update.json
+          release/zha-ota.json
+          release/z2m-ota.json
           release/ramses_esp_esp32_c6.bin
           release/ramses_esp_esp32_c6.bin.sha256
         generate_release_notes: true

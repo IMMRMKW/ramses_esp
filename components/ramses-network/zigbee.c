@@ -428,9 +428,14 @@ static esp_err_t zb_custom_cmd_handler(const esp_zb_zcl_custom_cluster_command_m
 	return ESP_OK;
 }
 
+#include "firmware_update.h"
+#include "esp_app_desc.h"
+
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void* message)
 {
 	switch (callback_id) {
+	case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID:
+		return firmware_zigbee_ota(message);
 	case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
 		return zb_custom_cmd_handler((const esp_zb_zcl_custom_cluster_command_message_t*)message);
 	default:
@@ -870,6 +875,7 @@ static void zigbee_stack_task(void* param)
 
 	esp_zb_ep_list_t* ep_list = esp_zb_ep_list_create();
 	esp_zb_cluster_list_t* cluster_list = esp_zb_zcl_cluster_list_create();
+	firmware_zigbee_ota_cluster(cluster_list);
 
 	esp_zb_attribute_list_t* basic_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_BASIC);
 	uint8_t zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE;
@@ -878,6 +884,13 @@ static void zigbee_stack_task(void* param)
 	esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_POWER_SOURCE_ID, &power_source);
 	esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void*)ESP_MANUFACTURER_NAME);
 	esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void*)ESP_MODEL_IDENTIFIER);
+	uint8_t hardware_version = 1;
+	static uint8_t software_build[33];
+	size_t version_length = strnlen(esp_app_get_description()->version, 31);
+	software_build[0] = version_length;
+	memcpy(software_build + 1, esp_app_get_description()->version, version_length);
+	esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID, &hardware_version);
+	esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, software_build);
 	esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
 	/* Cluster 0xFC00 as CLIENT (output) - sends custom commands to coordinator */
@@ -918,6 +931,7 @@ static void zigbee_stack_task(void* param)
 		xTimerStart(pairing_blink.hTimer, 0);
 
 	ESP_ERROR_CHECK(esp_zb_start(false));
+	esp_zb_scheduler_alarm(firmware_zigbee_ota_discover, 0, 60000);
 
 	esp_zb_stack_main_loop();
 }
