@@ -57,8 +57,10 @@ static void check_updates(void *unused)
 {
     for (;;) {
         char buffer[2048];
+        char manifest_url[256];
+        snprintf(manifest_url, sizeof(manifest_url), "%s/latest/download/update.json", CONFIG_OTA_URL_SERVER);
         esp_http_client_config_t config = {
-            .url = "https://github.com/IMMRMKW/ramses_esp/releases/latest/download/update.json",
+            .url = manifest_url,
             .crt_bundle_attach = esp_crt_bundle_attach, .timeout_ms = 15000,
         };
         esp_http_client_handle_t http = esp_http_client_init(&config);
@@ -133,7 +135,14 @@ void mqtt_update_connected(esp_mqtt_client_handle_t client, const char *topic)
     cJSON_AddStringToObject(dev, "model", "Ramses_esp32c6");
     cJSON_AddStringToObject(dev, "sw_version", esp_app_get_description()->version);
     char discovery[128];
-    snprintf(discovery, sizeof(discovery), "homeassistant/update/%s/config", unique);
+    /* Discovery topic object IDs allow only letters, digits, '_' and '-'.
+     * Keep the stable unique_id while sanitizing the RF device ID's colon. */
+    char object_id[sizeof(unique)];
+    strlcpy(object_id, unique, sizeof(object_id));
+    for (char *p = object_id; *p; ++p) {
+        if (*p == ':') *p = '_';
+    }
+    snprintf(discovery, sizeof(discovery), "homeassistant/update/%s/config", object_id);
     char *payload = cJSON_PrintUnformatted(config);
     if (payload) esp_mqtt_client_enqueue(mqtt, discovery, payload, 0, 1, 1, true);
     cJSON_free(payload);
@@ -157,7 +166,7 @@ bool mqtt_update_command(esp_mqtt_event_handle_t event)
         memcpy(version, latest, sizeof(version));
         portEXIT_CRITICAL(&lock);
         if (version[0] && strcmp(version, esp_app_get_description()->version)) {
-            ota_set_url("https://github.com/IMMRMKW/ramses_esp/releases");
+            ota_set_url(CONFIG_OTA_URL_SERVER);
             ota_set_filename("ramses_esp_c6.bin");
             ota_set_version(version);
             ota_start(0);

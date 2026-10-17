@@ -1,6 +1,6 @@
 # Firmware updates through Home Assistant
 
-The implementation is on the development branches, not yet on main or in a published release. A hardware OTA test is required before publishing it. The catalogue URLs below become available when a release containing this workflow is published.
+A release built with the firmware workflow supplies application images, Zigbee OTA images, and the catalogues described below. Existing firmware without an OTA client needs one initial manual upgrade.
 
 GitHub Releases hosts every file. A separate website is unnecessary. Latest-release catalogue URLs are stable, while each catalogue pins firmware downloads to a specific release tag.
 
@@ -57,6 +57,20 @@ Existing devices need one initial manual upgrade to gain these features. Merely 
 
 ## Validation before release
 
+Hardware testing verified ZHA v0.5.0 to v0.5.1, automatic Zigbee2MQTT v0.5.1 to v0.5.2, and automatic Wi-Fi/MQTT v0.5.4 to v0.5.5 using local sandbox catalogues. Real boot versions, retained configuration, and RAMSES communication were checked. The sandbox images contained local HTTP URLs and are not the production release images.
+
 Test a real older-to-newer update over Wi-Fi, ZHA, and Zigbee2MQTT. Verify that an interrupted download, power loss before switching partitions, a corrupt image, a repeated Install command, and a device restart all leave a recoverable device. Verify RAMSES traffic resumes after updating and that pairing/network settings survive. Software checks alone do not validate radio delivery or hardware reboot behaviour.
 
 References: [MQTT Update](https://www.home-assistant.io/integrations/update.mqtt/), [ZHA OTA](https://www.home-assistant.io/integrations/zha/#ota-updates-of-zigbee-device-firmware), [Z2M OTA](https://www.zigbee2mqtt.io/guide/usage/ota_updates.html), [Espressif's release-v1 OTA client](https://github.com/espressif/esp-zigbee-sdk/blob/release/v1.0/examples/esp_zigbee_ota/ota_client/main/esp_ota_client.c).
+
+## Try an older image and update wirelessly
+
+Use the v0.6.0 release as the baseline and v0.6.1 as the target. Each release provides:
+
+- `ramses_esp_esp32_c6.bin`: merged image for initial USB installation at flash address `0x0`.
+- `ramses_esp_c6.bin`: application image for Wi-Fi OTA. Do not use the merged image for an OTA application partition.
+- `ramses_esp_c6.ota`: standard Zigbee OTA image, referenced by the ZHA/Z2M catalogues.
+
+Install the baseline, configure the chosen network transport, then use the latest-release catalogue to discover the newer firmware. For Wi-Fi, connect Home Assistant's MQTT integration to the same broker and use the firmware Update entity. For Zigbee, configure the provider above or the Z2M OTA index. Both versions contain the OTA client; the older pre-OTA firmware cannot perform this test.
+
+The startup banner uses the actual ESP application descriptor, for example `# ramses_esp_c6 v0.6.0`. Normal builds read the checked-in `version.txt`; tagged release builds pass the tag as `RAMSES_RELEASE_VERSION`. Neither uses a Git dirty-worktree suffix. An invalid release version fails configuration, and packaging rejects an image whose embedded version differs from its release catalogue.

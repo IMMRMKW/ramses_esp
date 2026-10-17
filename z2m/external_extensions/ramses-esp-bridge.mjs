@@ -31,6 +31,13 @@
 /** Must match the topic_prefix configured in ramses_cc (mqtt_bridge.py). */
 const RAMSES_TOPIC_PREFIX = "RAMSES/GATEWAY";
 
+/**
+ * ramses_cc MQTT pools use 18:NNNNNN gateway IDs. RX is published under both
+ * the IEEE and the RF ID derived by the firmware's device_init() algorithm.
+ * Set IEEE -> RF gateway ID overrides here if a device uses a custom base MAC.
+ */
+const RAMSES_GATEWAY_IDS = {};
+
 /** Zigbee endpoint on the ESP32 (HA_ESP_SENSOR_ENDPOINT in firmware). */
 const RAMSES_ENDPOINT_ID = 10;
 
@@ -166,7 +173,8 @@ export default class RamsesEspBridge {
         const slashIdx = rest.indexOf("/");
         if (slashIdx === -1) return;
 
-        const ieee = rest.slice(0, slashIdx);
+        const ieee = this._resolveIeee(rest.slice(0, slashIdx));
+        if (!ieee) return;
         const suffix = rest.slice(slashIdx + 1); // "tx" | "cmd/cmd" | ...
 
         if (suffix === "tx") {
@@ -233,15 +241,38 @@ export default class RamsesEspBridge {
     // ── MQTT publish helpers ──────────────────────────────────────────────────
 
     /** Publish assembled frame: RAMSES/GATEWAY/{ieee}/rx  {"msg": "FRAME\r\n"} */
+    _gatewayId(ieee) {
+        if (RAMSES_GATEWAY_IDS[ieee]) return RAMSES_GATEWAY_IDS[ieee];
+        if (!/^0x[0-9a-f]{16}$/i.test(ieee)) return null;
+        // Matches firmware device_init(): the base MAC's low 18 bits.
+        const id = parseInt(ieee.slice(-6), 16) & 0x3ffff;
+        return `18:${String(id).padStart(6, "0")}`;
+    }
+
+    _resolveIeee(id) {
+        if (!/^18:\d{6}$/.test(id)) return id;
+        for (const device of this.zigbee.devicesIterator()) {
+            if (this._gatewayId(device.zh.ieeeAddr) === id) return device.zh.ieeeAddr;
+        }
+        return null;
+    }
+
+    _publishTopics(ieee, suffix, payload) {
+        const gatewayId = this._gatewayId(ieee);
+        for (const id of gatewayId ? [ieee, gatewayId] : [ieee]) {
+            this.mqtt.publish(`${id}/${suffix}`, payload, {baseTopic: RAMSES_TOPIC_PREFIX, skipReceive: false});
+        }
+    }
+
     _publishRx(ieee, frame) {
         const payload = JSON.stringify({msg: `${frame}\r\n`});
-        this.mqtt.publish(`${ieee}/rx`, payload, {baseTopic: RAMSES_TOPIC_PREFIX, skipReceive: false});
+        this._publishTopics(ieee, "rx", payload);
         this.logger.debug(`[RamsesEspBridge] RX ieee=${ieee}: ${frame}`);
     }
 
     /** Publish command result: RAMSES/GATEWAY/{ieee}/cmd/result */
     _publishResult(ieee, payload) {
-        this.mqtt.publish(`${ieee}/cmd/result`, payload, {baseTopic: RAMSES_TOPIC_PREFIX, skipReceive: false});
+        this._publishTopics(ieee, "cmd/result", payload);
         this.logger.debug(`[RamsesEspBridge] CMD result ieee=${ieee}: ${payload}`);
     }
 
@@ -260,7 +291,7 @@ export default class RamsesEspBridge {
         }
         // Fallback: iterate all known devices.
         for (const device of this.zigbee.devicesIterator()) {
-            if (device.zh.ieeeAddr === ieee) {
+            if (device.zh.ieeeAddr === ieee || this._gatewayId(device.zh.ieeeAddr) === ieee) {
                 const ep = device.zh.getEndpoint(RAMSES_ENDPOINT_ID);
                 if (ep) return ep;
             }
